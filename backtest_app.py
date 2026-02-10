@@ -3,7 +3,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import altair as alt
-import uuid  # 引入 UUID 库生成唯一 ID
+import uuid
+import json
 from datetime import datetime, timedelta
 
 # --- 1. 页面基本配置 ---
@@ -20,11 +21,16 @@ TICKER_TO_NAME = {
 if 'expanded' not in st.session_state:
     st.session_state.expanded = True
 
-# --- 核心修复：初始化时分配唯一 ID ---
+# --- 核心修复 1：统一初始化所有 Session State ---
+# 先给变量“占座”，防止组件初始化冲突警告
+if 'bi' not in st.session_state: st.session_state['bi'] = "SPY"
+if 'sd' not in st.session_state: st.session_state['sd'] = datetime(2022, 1, 1)
+if 'if' not in st.session_state: st.session_state['if'] = 10000
+
 if 'portfolios_list' not in st.session_state:
     st.session_state.portfolios_list = [
         {
-            "id": str(uuid.uuid4()), # 唯一身份证
+            "id": str(uuid.uuid4()), 
             "name": "组合 A", 
             "tickers": "IVV, QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD", 
             "weights": "0.20, 0.20, 0.15, 0.10, 0.10, 0.10, 0.10, 0.05", 
@@ -32,7 +38,7 @@ if 'portfolios_list' not in st.session_state:
             "thr": 40
         },
         {
-            "id": str(uuid.uuid4()), # 唯一身份证
+            "id": str(uuid.uuid4()), 
             "name": "组合 B", 
             "tickers": "159941.SZ, 513500.SS, 512890.SS, 512400.SS, 515220.SS, 588080.SS, 518880.SS", 
             "weights": "0.20, 0.25, 0.2, 0.05, 0.10, 0.05, 0.15", 
@@ -41,7 +47,6 @@ if 'portfolios_list' not in st.session_state:
         }
     ]
 
-# 回调函数：根据 ID 精准删除
 def delete_portfolio(idx):
     if 0 <= idx < len(st.session_state.portfolios_list):
         st.session_state.portfolios_list.pop(idx)
@@ -130,14 +135,28 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
 
         do_rebalance = False
         new_values = asset_values.copy()
+        
         if strategy_name == "定期再平衡(年度)":
-            if (current_date - last_rebalance_date).days >= 365: new_values, do_rebalance = total_val * target_weights, True
+            if (current_date - last_rebalance_date).days >= 365: 
+                new_values, do_rebalance = total_val * target_weights, True
+        elif strategy_name == "定期再平衡(半年度)":
+            if (current_date - last_rebalance_date).days >= 180: 
+                new_values, do_rebalance = total_val * target_weights, True
         elif "相对差" in strategy_name:
             rel_diffs = np.abs(current_weights - target_weights) / target_weights.replace(0, 1e-9)
             if rel_diffs.max() > threshold:
-                if strategy_name == "相对差混合再平衡" and ((target_weights >= 0.1) & (rel_diffs > threshold)).any(): new_values = total_val * target_weights
-                else: new_values = apply_local_rebalance(asset_values, target_weights, threshold)
-                do_rebalance = True
+                if strategy_name == "相对差全局再平衡":
+                    new_values = total_val * target_weights
+                    do_rebalance = True
+                elif strategy_name == "相对差混合再平衡":
+                    if ((target_weights >= 0.1) & (rel_diffs > threshold)).any():
+                        new_values = total_val * target_weights
+                    else:
+                        new_values = apply_local_rebalance(asset_values, target_weights, threshold)
+                    do_rebalance = True
+                elif strategy_name == "相对差局部再平衡":
+                    new_values = apply_local_rebalance(asset_values, target_weights, threshold)
+                    do_rebalance = True
         
         if do_rebalance:
             rebalance_count += 1
@@ -155,32 +174,80 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
     return pd.DataFrame(history), rebalance_count
 
 # --- 3. UI 界面 ---
+with st.sidebar:
+    st.header("💾 配置管理")
+    st.markdown("将当前的组合、基准、日期等所有设置保存到本地，或从本地加载。")
+    
+    current_config = {
+        "benchmark": st.session_state['bi'],
+        "start_date": str(st.session_state['sd']),
+        "initial_funds": st.session_state['if'],
+        "portfolios": st.session_state.portfolios_list
+    }
+    json_str = json.dumps(current_config, indent=2, ensure_ascii=False)
+    st.download_button(
+        label="📥 导出当前配置",
+        data=json_str,
+        file_name="asset_allocation_config.json",
+        mime="application/json"
+    )
+    
+    st.divider()
+    
+    uploaded_file = st.file_uploader("📤 导入配置", type=["json"])
+    if uploaded_file is not None:
+        try:
+            loaded_config = json.load(uploaded_file)
+            if st.button("确认覆盖当前设置"):
+                st.session_state.portfolios_list = loaded_config.get("portfolios", [])
+                for p in st.session_state.portfolios_list:
+                    if 'id' not in p: p['id'] = str(uuid.uuid4())
+                
+                # 直接更新 Session State
+                st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
+                st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2022-01-01")).date()
+                st.session_state['if'] = loaded_config.get("initial_funds", 10000)
+                
+                st.success("配置已加载！页面将自动刷新。")
+                st.rerun()
+        except Exception as e:
+            st.error(f"配置文件解析失败: {e}")
+
 with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.session_state.expanded):
     c1, c2, c3 = st.columns([2, 2, 1])
-    with c1: bench_in = st.text_input("对比基准 (决定交易日历)", "SPY", key="bi")
-    with c2: start_d = st.date_input("设定开始时间", datetime(2022, 1, 1), key="sd")
-    with c3: init_f = st.number_input("初始资金", value=10000, key="if")
+    
+    # --- 核心修复 2：删除 value 参数，完全依赖 session_state ---
+    # 这样当 Load 功能修改了 session_state 后，组件会自动更新，不会报警
+    with c1: 
+        bench_in = st.text_input("对比基准 (决定交易日历)", key="bi")
+    with c2: 
+        start_d = st.date_input("设定开始时间", key="sd")
+    with c3: 
+        init_f = st.number_input("初始资金", key="if")
+        
     st.divider()
-    strategy_options = ["无 (Buy & Hold)", "定期再平衡(年度)", "相对差局部再平衡", "相对差混合再平衡"]
+    
+    strategy_options = [
+        "无 (Buy & Hold)", 
+        "定期再平衡(年度)", 
+        "定期再平衡(半年度)", 
+        "相对差局部再平衡", 
+        "相对差混合再平衡",
+        "相对差全局再平衡"
+    ]
     
     total_portfolios = len(st.session_state.portfolios_list)
     
     for i, port in enumerate(st.session_state.portfolios_list):
-        # 兼容性修复：防止旧缓存报错，如果没有 ID 则补发一个
-        if 'id' not in port:
-            port['id'] = str(uuid.uuid4())
+        if 'id' not in port: port['id'] = str(uuid.uuid4())
 
         h1, h2 = st.columns([8, 1])
         with h1: st.markdown(f"#### 📦 {port['name']}")
         with h2: 
             if total_portfolios > 1:
-                # 使用 unique ID 作为按钮 key 的一部分，彻底避免混淆
                 st.button("🗑️", key=f"del_btn_{port['id']}", on_click=delete_portfolio, args=(i,))
 
         col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-        
-        # 核心修复：Key 绑定到 port['id'] 而不是索引 i
-        # 这样无论列表怎么删减，port['id'] 是不变的，Streamlit 就能找到正确的缓存
         with col1: port['tickers'] = st.text_input(f"代码", port['tickers'], key=f"t_{port['id']}")
         with col2: port['weights'] = st.text_input(f"占比", port['weights'], key=f"w_{port['id']}")
         with col3: port['strat'] = st.selectbox(f"策略", strategy_options, index=strategy_options.index(port['strat']), key=f"s_{port['id']}")
@@ -196,7 +263,7 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
             
             last_port = st.session_state.portfolios_list[-1]
             st.session_state.portfolios_list.append({
-                "id": str(uuid.uuid4()),  # 新组合必须有新 ID
+                "id": str(uuid.uuid4()), 
                 "name": f"组合 {chr(new_char_code)}", 
                 "tickers": last_port["tickers"],
                 "weights": last_port["weights"],
