@@ -21,8 +21,7 @@ TICKER_TO_NAME = {
 if 'expanded' not in st.session_state:
     st.session_state.expanded = True
 
-# --- 核心修复 1：统一初始化所有 Session State ---
-# 先给变量“占座”，防止组件初始化冲突警告
+# --- 初始化 Session State ---
 if 'bi' not in st.session_state: st.session_state['bi'] = "SPY"
 if 'sd' not in st.session_state: st.session_state['sd'] = datetime(2022, 1, 1)
 if 'if' not in st.session_state: st.session_state['if'] = 10000
@@ -203,7 +202,6 @@ with st.sidebar:
                 for p in st.session_state.portfolios_list:
                     if 'id' not in p: p['id'] = str(uuid.uuid4())
                 
-                # 直接更新 Session State
                 st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
                 st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2022-01-01")).date()
                 st.session_state['if'] = loaded_config.get("initial_funds", 10000)
@@ -215,15 +213,9 @@ with st.sidebar:
 
 with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.session_state.expanded):
     c1, c2, c3 = st.columns([2, 2, 1])
-    
-    # --- 核心修复 2：删除 value 参数，完全依赖 session_state ---
-    # 这样当 Load 功能修改了 session_state 后，组件会自动更新，不会报警
-    with c1: 
-        bench_in = st.text_input("对比基准 (决定交易日历)", key="bi")
-    with c2: 
-        start_d = st.date_input("设定开始时间", key="sd")
-    with c3: 
-        init_f = st.number_input("初始资金", key="if")
+    with c1: bench_in = st.text_input("对比基准 (决定交易日历)", key="bi")
+    with c2: start_d = st.date_input("设定开始时间", key="sd")
+    with c3: init_f = st.number_input("初始资金", key="if")
         
     st.divider()
     
@@ -272,13 +264,51 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
             })
             st.rerun()
     with b2:
-        if st.button("🚀 确定运行", type="primary"): 
-            st.session_state.expanded = False; st.rerun()
+        # --- 核心新增：前置校验逻辑 ---
+        if st.button("🚀 确定运行", type="primary"):
+            validation_pass = True
+            error_msgs = []
+            
+            for p in st.session_state.portfolios_list:
+                # 兼容中文逗号，防止用户手误
+                t_str = p['tickers'].replace("，", ",")
+                w_str = p['weights'].replace("，", ",")
+                
+                # 1. 解析数据
+                t_list = [x.strip() for x in t_str.split(',') if x.strip()]
+                w_list = [x.strip() for x in w_str.split(',') if x.strip()]
+                
+                # 2. 数量匹配校验
+                if len(t_list) != len(w_list):
+                    validation_pass = False
+                    error_msgs.append(f"❌ **{p['name']}** 配置错误：代码有 {len(t_list)} 个，但占比有 {len(w_list)} 个，请检查逗号分隔。")
+                    continue # 跳过该组合的后续检查
+                
+                # 3. 权重归一校验
+                try:
+                    w_floats = [float(w) for w in w_list]
+                    total_w = sum(w_floats)
+                    # 容许 0.01 的浮点误差
+                    if abs(total_w - 1.0) > 0.01:
+                        validation_pass = False
+                        error_msgs.append(f"⚠️ **{p['name']}** 权重异常：当前总和为 **{total_w:.2f}**，请调整至 **1.0**。")
+                except ValueError:
+                    validation_pass = False
+                    error_msgs.append(f"❌ **{p['name']}** 占比格式错误：请确保输入的都是数字。")
+
+            if validation_pass:
+                # 只有全通过才收起面板并运行
+                st.session_state.expanded = False
+                st.rerun()
+            else:
+                # 有错误，直接弹窗提示，不收起面板
+                for msg in error_msgs:
+                    st.error(msg)
 
 # --- 4. 执行逻辑 ---
 if not st.session_state.expanded:
     with st.spinner('正在基于基准日历同步全球数据...'):
-        all_tks = list(set([clean_ticker(bench_in)] + [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].split(",")]))
+        all_tks = list(set([clean_ticker(bench_in)] + [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].replace("，", ",").split(",")]))
         df_raw = yf.download(all_tks, start=start_d - timedelta(days=20), progress=False)
         if df_raw.empty: st.error("下载失败。"); st.stop()
 
@@ -301,7 +331,7 @@ if not st.session_state.expanded:
         df_aligned = df_aligned[df_aligned.index >= market_start_day]
         df_filled = df_aligned.ffill().bfill()
 
-        all_port_tks = [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].split(",")]
+        all_port_tks = [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].replace("，", ",").split(",")]
         raw_aligned = df_aligned[all_port_tks]
         first_valid_idx = raw_aligned.apply(lambda x: x.first_valid_index())
         bottleneck_date = first_valid_idx.max()
@@ -330,10 +360,16 @@ if not st.session_state.expanded:
         res_list = {}
         
         for p in st.session_state.portfolios_list:
-            p_tks = [clean_ticker(t) for t in p['tickers'].split(",")]
+            # 同样兼容中文逗号
+            t_str = p['tickers'].replace("，", ",")
+            w_str = p['weights'].replace("，", ",")
+            
+            p_tks = [clean_ticker(t) for t in t_str.split(",")]
+            p_wts = [float(w) for w in w_str.split(",")]
+            
             valid_p_tks = [t for t in p_tks if t in price_df.columns and not price_df[t].isna().all()]
             if not valid_p_tks: continue
-            p_wts = [float(w) for w in p['weights'].split(",")]
+            
             if len(valid_p_tks) < len(p_tks):
                 w_series = pd.Series(p_wts[:len(p_tks)], index=p_tks)[valid_p_tks]
                 w_series = w_series / w_series.sum()
