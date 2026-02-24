@@ -9,13 +9,13 @@ from datetime import datetime, timedelta
 
 # --- 1. 页面基本配置 ---
 st.set_page_config(page_title="资产配置实验室 Pro", layout="wide")
-st.title("⚖️ 基金组合全维度优化系统")
+st.title("⚖️ 基金组合全维度优化系统 v3.2")
 
 # 代码与中文名映射表 (5字限制)
 TICKER_TO_NAME = {
     "159941.SZ": "纳指ETF", "513500.SS": "标普500", "512890.SS": "红利低波",
     "512400.SS": "有色金属", "515220.SS": "煤炭ETF", "588080.SS": "科创50",
-    "518880.SS": "黄金ETF", "510300.SS": "沪深300", "511130.SS": "企债ETF"
+    "518880.SS": "黄金ETF", "510300.SS": "沪深300", "511130.SS": "30年国债"
 }
 
 if 'expanded' not in st.session_state:
@@ -23,7 +23,6 @@ if 'expanded' not in st.session_state:
 
 # --- 初始化 Session State ---
 if 'bi' not in st.session_state: st.session_state['bi'] = "SPY"
-# 将默认起始时间改为 2020-01-01
 if 'sd' not in st.session_state: st.session_state['sd'] = datetime(2020, 1, 1)
 if 'if' not in st.session_state: st.session_state['if'] = 10000
 
@@ -35,7 +34,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD", 
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05", 
             "strat": "不对称相对差再平衡", 
-            "thr": 40
+            "thr": 38  # <-- 修改为 38
         },
         {
             "id": str(uuid.uuid4()), 
@@ -43,7 +42,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "159941.SZ, 512890.SS, 515220.SS, 588080.SS, 518880.SS, 511130.SS", 
             "weights": "0.35, 0.15, 0.10, 0.05, 0.15, 0.20", 
             "strat": "相对差混合再平衡", 
-            "thr": 40
+            "thr": 38  # <-- 修改为 38
         }
     ]
 
@@ -218,7 +217,6 @@ with st.sidebar:
                     if 'id' not in p: p['id'] = str(uuid.uuid4())
                 
                 st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
-                # 这里同步修改了默认加载后备时间为 2020-01-01
                 st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
                 st.session_state['if'] = loaded_config.get("initial_funds", 10000)
                 
@@ -282,7 +280,7 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
                 "tickers": last_port["tickers"],
                 "weights": last_port["weights"],
                 "strat": "不对称相对差再平衡", 
-                "thr": 40
+                "thr": 38  # <-- 修改为 38
             })
             st.rerun()
     with b2:
@@ -369,10 +367,16 @@ if not st.session_state.expanded:
 
         final_data = df_filled[df_filled.index >= actual_start_day]
         if final_data.empty: st.error("数据不足。"); st.stop()
-        first_row = final_data.iloc[[0]]
-        monthly_rows = final_data.resample('ME').last()
-        price_df = pd.concat([first_row, monthly_rows]).sort_index()
-        price_df = price_df[~price_df.index.duplicated(keep='first')]
+        
+        days_span = (final_data.index[-1] - final_data.index[0]).days
+        
+        if days_span < 90:
+            price_df = final_data.copy()
+        else:
+            first_row = final_data.iloc[[0]]
+            monthly_rows = final_data.resample('ME').last()
+            price_df = pd.concat([first_row, monthly_rows]).sort_index()
+            price_df = price_df[~price_df.index.duplicated(keep='first')]
 
         comp_df = pd.DataFrame(index=price_df.index)
         bench_nav = (price_df[bench_tk] / price_df[bench_tk].iloc[0]) * init_f
@@ -418,14 +422,17 @@ if not st.session_state.expanded:
         comp_df.index.name = '日期'
         chart_data = comp_df.dropna().reset_index().melt('日期', var_name='组合', value_name='净值')
         
+        x_axis_format = '%Y-%m-%d' if days_span < 90 else '%Y-%m'
+        label_angle = -45 if days_span < 90 else 0
+        
         base_chart = alt.Chart(chart_data).mark_line().encode(
-            x=alt.X('日期', axis=alt.Axis(format='%Y-%m', title='日期')),
-            y=alt.Y('净值', axis=alt.Axis(format=',.0f', title='组合净值')),
+            x=alt.X('日期', axis=alt.Axis(format=x_axis_format, title='日期', labelAngle=label_angle)),
+            y=alt.Y('净值', scale=alt.Scale(zero=False), axis=alt.Axis(format=',.0f', title='组合净值')),
             color=alt.Color('组合', legend=alt.Legend(title="组合名称", orient='top')),
             tooltip=[alt.Tooltip('日期', format='%Y-%m-%d'), '组合', alt.Tooltip('净值', format=',.2f')]
         ).properties(
             height=500,
-            title="组合净值走势 (静态视图)"
+            title="组合净值走势 (动态缩放)"
         )
         st.altair_chart(base_chart, use_container_width=True)
         
