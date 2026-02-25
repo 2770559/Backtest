@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 # --- 1. 页面基本配置 ---
 st.set_page_config(page_title="资产配置实验室 Pro", layout="wide")
-st.title("⚖️ 基金组合全维度优化系统 v3.2")
+st.title("⚖️ 基金组合全维度优化系统 v3.9")
 
 # 代码与中文名映射表 (5字限制)
 TICKER_TO_NAME = {
@@ -34,7 +34,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD", 
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05", 
             "strat": "不对称相对差再平衡", 
-            "thr": 38  # <-- 修改为 38
+            "thr": 38
         },
         {
             "id": str(uuid.uuid4()), 
@@ -42,7 +42,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "159941.SZ, 512890.SS, 515220.SS, 588080.SS, 518880.SS, 511130.SS", 
             "weights": "0.35, 0.15, 0.10, 0.05, 0.15, 0.20", 
             "strat": "相对差混合再平衡", 
-            "thr": 38  # <-- 修改为 38
+            "thr": 38
         }
     ]
 
@@ -107,21 +107,28 @@ def apply_local_rebalance(asset_values, target_weights, threshold):
 
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, threshold):
     tickers = price_df.columns
-    if price_df.empty: return pd.DataFrame(), 0
+    if price_df.empty: return pd.DataFrame(), 0, {}
     start_prices = price_df.iloc[0]
     if start_prices.isna().any():
         start_prices = price_df.bfill().iloc[0]
-        if start_prices.isna().any(): return pd.DataFrame(), 0
+        if start_prices.isna().any(): return pd.DataFrame(), 0, {}
 
     current_shares = (initial_cap * target_weights) / start_prices
     history = []
     last_rebalance_date = price_df.index[0]
     rebalance_count = 0
     price_df_filled = price_df.ffill()
+    
+    cumulative_pnl = pd.Series(0.0, index=tickers)
+    prev_prices = start_prices
 
     for i in range(len(price_df)):
         current_date = price_df.index[i]
         current_prices = price_df_filled.iloc[i]
+        
+        if i > 0: cumulative_pnl += current_shares * (current_prices - prev_prices)
+        prev_prices = current_prices
+        
         asset_values = current_shares * current_prices
         total_val = asset_values.sum()
         if total_val == 0 or np.isnan(total_val): continue
@@ -184,7 +191,13 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
             rec = {"日期": current_date, "类型": "常规", "净值": total_val}
             rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(rec)
-    return pd.DataFrame(history), rebalance_count
+            
+    total_pnl = cumulative_pnl.sum()
+    pct_pnl = cumulative_pnl / total_pnl if total_pnl != 0 else cumulative_pnl * 0
+    pnl_rec = {"日期": "全过程", "类型": "盈亏贡献占比", "净值": float(total_pnl)}
+    pnl_rec.update({f"{t}": f"{pct_pnl[t]:.2%}" for t in tickers})
+    
+    return pd.DataFrame(history), rebalance_count, pnl_rec
 
 # --- 3. UI 界面 ---
 with st.sidebar:
@@ -280,18 +293,16 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
                 "tickers": last_port["tickers"],
                 "weights": last_port["weights"],
                 "strat": "不对称相对差再平衡", 
-                "thr": 38  # <-- 修改为 38
+                "thr": 38
             })
             st.rerun()
     with b2:
         if st.button("🚀 确定运行", type="primary"):
             validation_pass = True
             error_msgs = []
-            
             for p in st.session_state.portfolios_list:
                 t_str = p['tickers'].replace("，", ",")
                 w_str = p['weights'].replace("，", ",")
-                
                 t_list = [x.strip() for x in t_str.split(',') if x.strip()]
                 w_list = [x.strip() for x in w_str.split(',') if x.strip()]
                 
@@ -299,7 +310,6 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
                     validation_pass = False
                     error_msgs.append(f"❌ **{p['name']}** 配置错误：代码有 {len(t_list)} 个，但占比有 {len(w_list)} 个，请检查逗号分隔。")
                     continue 
-                
                 try:
                     w_floats = [float(w) for w in w_list]
                     total_w = sum(w_floats)
@@ -319,6 +329,18 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
 
 # --- 4. 执行逻辑 ---
 if not st.session_state.expanded:
+    
+    st.markdown("### 📊 回测结果分析")
+    
+    col_opt1, col_opt2, col_opt3 = st.columns([3.5, 1, 5.5])
+    with col_opt1: 
+        inf_adj = st.checkbox("💸 开启通胀调整 (固定年化贴现率 % ➔)", value=False)
+    
+    inf_rate = 0.0
+    if inf_adj: 
+        with col_opt2:
+            inf_rate = st.number_input("通胀率", value=3.0, step=0.1, format="%.1f", label_visibility="collapsed") / 100.0
+    
     with st.spinner('正在基于基准日历同步全球数据...'):
         all_tks = list(set([clean_ticker(bench_in)] + [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].replace("，", ",").split(",")]))
         df_raw = yf.download(all_tks, start=start_d - timedelta(days=20), progress=False)
@@ -381,9 +403,9 @@ if not st.session_state.expanded:
         comp_df = pd.DataFrame(index=price_df.index)
         bench_nav = (price_df[bench_tk] / price_df[bench_tk].iloc[0]) * init_f
         comp_df[f"基准({bench_in})"] = bench_nav
-        metrics = [calculate_metrics(bench_nav, 0)]
-        metrics[-1]["回测维度"] = f"基准({bench_in})"
+        
         res_list = {}
+        valid_ports_meta = {}
         
         for p in st.session_state.portfolios_list:
             t_str = p['tickers'].replace("，", ",")
@@ -400,47 +422,97 @@ if not st.session_state.expanded:
                 w_series = w_series / w_series.sum()
             else: w_series = pd.Series(p_wts, index=p_tks)
 
-            res_df, cnt = run_detailed_backtest(p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0)
+            res_df, cnt, pnl_rec = run_detailed_backtest(p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0)
             
             if not res_df.empty:
                 df_chart = res_df.drop_duplicates(subset='日期', keep='last').copy()
                 df_chart['日期'] = pd.to_datetime(df_chart['日期'])
                 df_chart = df_chart.set_index('日期')
                 comp_df[p['name']] = df_chart['净值']
-                
-                m = calculate_metrics(comp_df[p['name']], cnt)
-                m["回测维度"] = p['name']
-                metrics.append(m)
+                valid_ports_meta[p['name']] = cnt
                 
                 def clean_col(c):
                     target = c.replace("占比", "").strip()
                     for tk, name in TICKER_TO_NAME.items():
                         if tk in target: return name[:5]
                     return target
-                res_list[p['name']] = res_df.iloc[::-1].rename(columns=clean_col).reset_index(drop=True)
+                
+                translated_pnl = {}
+                for k, v in pnl_rec.items(): translated_pnl[clean_col(k)] = v
+                pnl_df = pd.DataFrame([translated_pnl])
+                
+                df_history = res_df.iloc[::-1].rename(columns=clean_col).reset_index(drop=True)
+                df_history['日期'] = pd.to_datetime(df_history['日期']).dt.strftime('%Y-%m-%d')
+                res_list[p['name']] = pd.concat([pnl_df, df_history], ignore_index=True)
+
+        if inf_adj:
+            start_date_ts = pd.Timestamp(actual_start_day)
+            days_diff = (comp_df.index - start_date_ts).days
+            discount_factors = (1 + inf_rate) ** (days_diff / 365.25)
+            for col in comp_df.columns: 
+                comp_df[col] = comp_df[col] / discount_factors
+
+        metrics = []
+        bench_m = calculate_metrics(comp_df[f"基准({bench_in})"], 0)
+        bench_m["回测维度"] = f"基准({bench_in})"
+        metrics.append(bench_m)
+        
+        for p_name, cnt in valid_ports_meta.items():
+            m = calculate_metrics(comp_df[p_name], cnt)
+            m["回测维度"] = p_name
+            metrics.append(m)
 
         comp_df.index.name = '日期'
-        chart_data = comp_df.dropna().reset_index().melt('日期', var_name='组合', value_name='净值')
+        
+        chart_df = comp_df / comp_df.iloc[0] - 1
         
         x_axis_format = '%Y-%m-%d' if days_span < 90 else '%Y-%m'
         label_angle = -45 if days_span < 90 else 0
         
-        base_chart = alt.Chart(chart_data).mark_line().encode(
-            x=alt.X('日期', axis=alt.Axis(format=x_axis_format, title='日期', labelAngle=label_angle)),
-            y=alt.Y('净值', scale=alt.Scale(zero=False), axis=alt.Axis(format=',.0f', title='组合净值')),
-            color=alt.Color('组合', legend=alt.Legend(title="组合名称", orient='top')),
-            tooltip=[alt.Tooltip('日期', format='%Y-%m-%d'), '组合', alt.Tooltip('净值', format=',.2f')]
-        ).properties(
-            height=500,
-            title="组合净值走势 (动态缩放)"
+        chart_data = chart_df.reset_index().melt('日期', var_name='组合', value_name='收益率')
+        rule_data = chart_df.reset_index()
+        
+        nearest = alt.selection_point(nearest=True, on='mouseover', fields=['日期'], empty=False)
+        
+        line = alt.Chart(chart_data).mark_line().encode(
+            x=alt.X('日期:T', axis=alt.Axis(format=x_axis_format, title='日期', labelAngle=label_angle)),
+            y=alt.Y('收益率:Q', axis=alt.Axis(format='.1%', title='累计收益率 (扣除通胀)' if inf_adj else '累计收益率')),
+            color=alt.Color('组合:N', legend=alt.Legend(title="组合名称", orient='top'))
         )
+        
+        # 准备显示的全量数据提示框
+        tooltips = [alt.Tooltip('日期:T', format='%Y-%m-%d', title='日期')]
+        for col in chart_df.columns:
+            tooltips.append(alt.Tooltip(field=col, type='quantitative', format='.2%', title=col))
+            
+        # 核心修复：将 tooltip 绑定在 opacity=0.001 (几乎不可见) 且极宽的柱子上，实现真正的“全屏悬停触发”
+        selectors = alt.Chart(rule_data).mark_rule(opacity=0.001, strokeWidth=40).encode(
+            x='日期:T',
+            tooltip=tooltips  # <--- 加回这一行，悬停在空白处也能带出数据！
+        ).add_params(nearest)
+        
+        # 视觉辅助线：灰色虚线
+        rules = alt.Chart(rule_data).mark_rule(color='gray', strokeDash=[3,3]).encode(
+            x='日期:T',
+            tooltip=tooltips
+        ).transform_filter(nearest)
+        
+        points = line.mark_point(size=60).encode(
+            opacity=alt.condition(nearest, alt.value(1), alt.value(0))
+        )
+        
+        base_chart = alt.layer(line, selectors, rules, points).properties(
+            height=500, title="组合累计收益率走势对比"
+        )
+        
         st.altair_chart(base_chart, use_container_width=True)
         
         if metrics: st.table(pd.DataFrame(metrics).set_index("回测维度"))
         st.divider()
         for lbl, data in res_list.items():
-            with st.expander(f"📋 调仓明细: {lbl} (首次配置日: {actual_start_day.date()})"):
+            with st.expander(f"📋 调仓明细 & 盈亏贡献: {lbl} (首次配置日: {actual_start_day.date()})"):
                 def style_row(row):
+                    if row['类型'] == '盈亏贡献占比': return ['background-color: #fce4ec; color: #d81b60; font-weight: bold'] * len(row)
                     if row['类型'] == '首次配置': return ['background-color: #e3f2fd; font-weight: bold'] * len(row)
                     if row['类型'] == '再平衡前': return ['background-color: #fff3e0'] * len(row)
                     if row['类型'] == '再平衡后': return ['background-color: #e8f5e9'] * len(row)
