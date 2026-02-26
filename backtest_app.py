@@ -242,7 +242,15 @@ with st.expander("🛠️ 资产配置实验室 (配置模式)", expanded=st.ses
     c1, c2, c3 = st.columns([2, 2, 1])
     
     bench_in = c1.text_input("对比基准 (决定交易日历)", value=st.session_state['bi'])
-    start_d = c2.date_input("设定开始时间", value=st.session_state['sd'])
+    
+    # 核心修复点：强制解除 10 年的时间封印，最早可以选到 1970 年！
+    start_d = c2.date_input(
+        "设定开始时间", 
+        value=st.session_state['sd'], 
+        min_value=datetime(1970, 1, 1).date(), 
+        max_value=datetime.today().date()
+    )
+    
     init_f = c3.number_input("初始资金", value=st.session_state['if'])
     
     st.session_state['bi'] = bench_in
