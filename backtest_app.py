@@ -164,13 +164,27 @@ button[kind="secondary"][data-testid="stBaseButton-secondary"]:has(p) {
     /* fallback handled by .del-btn class below */
 }
 
-/* Primary action button (Run Backtest) */
+/* Primary action button (Analyze) — match secondary button size */
 button[kind="primary"] {
     border-radius: 0.5rem !important;
     font-weight: 600 !important;
+    font-size: inherit !important;
     letter-spacing: 0.02em;
     padding: 0.5rem 1.5rem !important;
+    min-height: 0 !important;
+    line-height: normal !important;
     transition: transform 0.1s, box-shadow 0.15s !important;
+}
+button[kind="primary"] div {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 0.35rem !important;
+    flex-direction: row !important;
+}
+button[kind="primary"] p {
+    display: inline !important;
+    margin: 0 !important;
 }
 button[kind="primary"]:hover {
     transform: translateY(-1px) !important;
@@ -594,7 +608,7 @@ for i, port in enumerate(st.session_state.portfolios_list):
         if total_portfolios > 1:
             st.button(":material/delete:", key=f"del_{port['id']}", on_click=delete_portfolio, args=(i,))
 
-btn_cols = st.columns([1, 1, 6])
+btn_cols = st.columns([1, 1.5, 5.5])
 with btn_cols[0]:
     if st.button(":material/add_circle: Add", use_container_width=True):
         existing_names = set(p["name"] for p in st.session_state.portfolios_list)
@@ -608,7 +622,7 @@ with btn_cols[0]:
         })
         st.rerun()
 with btn_cols[1]:
-    run_clicked = st.button(":material/play_arrow: Run Backtest", type="primary", use_container_width=True)
+    run_clicked = st.button(":material/play_arrow: Analyze", type="primary", use_container_width=True)
     if run_clicked:
         validation_pass = True
         error_msgs = []
