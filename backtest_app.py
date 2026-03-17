@@ -675,7 +675,9 @@ if st.session_state.run_backtest:
         if future_days.empty: st.error(f"No data after {start_d}."); st.stop()
         market_start_day = future_days[0]
 
-        df_aligned = price_data.reindex(bench_valid_days)
+        # ffill on full calendar first so weekend crypto prices carry to next trading day
+        price_data_prefilled = price_data.ffill()
+        df_aligned = price_data_prefilled.reindex(bench_valid_days)
         df_aligned = df_aligned[df_aligned.index >= market_start_day]
         df_filled = df_aligned.ffill().bfill()
 

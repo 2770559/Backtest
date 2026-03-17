@@ -1,0 +1,15 @@
+{
+  "benchmark": "SPY",
+  "start_date": "2007-01-01",
+  "initial_funds": 10000,
+  "portfolios": [
+    {
+      "id": "c7c65a72-fe12-4aa7-8270-e9c8eb70b176",
+      "name": "组合 B",
+      "tickers": " QQQ, BRK.B, GLD, XLE, RYMTX",
+      "weights": "0.40, 0.15, 0.15, 0.10, 0.20",
+      "strat": "RelDiff Mixed",
+      "thr": 40
+    }
+  ]
+}

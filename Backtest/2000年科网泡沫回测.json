@@ -1,0 +1,23 @@
+{
+  "benchmark": "SPY",
+  "start_date": "2000-01-01",
+  "initial_funds": 10000,
+  "portfolios": [
+    {
+      "id": "c568008b-473e-4a17-ad37-193559a4b600",
+      "name": "组合 A",
+      "tickers": "QQQ, BRK.B, CEF, XLE, VBMFX",
+      "weights": "0.40, 0.15, 0.15, 0.10,0.2",
+      "strat": "Asymmetric RelDiff",
+      "thr": 38
+    },
+    {
+      "id": "11b2ed15-1099-4b19-8e79-809beafe1cfe",
+      "name": "组合 B",
+      "tickers": "SPY, QQQ, BRK.B, CEF, XLE, VBMFX",
+      "weights": "0.2, 0.20, 0.15, 0.15, 0.10,0.2",
+      "strat": "Asymmetric RelDiff",
+      "thr": 38
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "benchmark": "SPY",
+  "start_date": "2020-01-01",
+  "initial_funds": 10000,
+  "portfolios": [
+    {
+      "id": "819739b2-7f6d-4014-9fb0-daf1a4b84f7b",
+      "name": "组合 A",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD",
+      "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
+      "strat": "RelDiff Mixed",
+      "thr": 40
+    },
+    {
+      "id": "8cd45f95-5d9d-4652-b973-54f3ffcd81f6",
+      "name": "组合 B",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, Bito",
+      "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
+      "strat": "RelDiff Mixed",
+      "thr": 40
+    }
+  ]
+}

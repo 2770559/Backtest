@@ -1,0 +1,39 @@
+{
+  "benchmark": "SPY",
+  "start_date": "2026-01-01",
+  "initial_funds": 10000,
+  "portfolios": [
+    {
+      "id": "121a0bee-c5ef-4b1c-bb51-5b5da5570400",
+      "name": "组合 A",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, BTC-USD,RSST,SGOV",
+      "weights": "0.20, 0.15, 0.12, 0.10, 0.08, 0.08, 0.07,0.15,0.05",
+      "strat": "Asymmetric RelDiff",
+      "thr": 38
+    },
+    {
+      "id": "b863aee7-52ea-4775-aa6c-f77c4bd37e90",
+      "name": "组合 B",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, BTC-USD",
+      "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10,0.05",
+      "strat": "Asymmetric RelDiff",
+      "thr": 38
+    },
+    {
+      "id": "28f068ac-d535-4e15-8103-61b4afa6dd9c",
+      "name": "组合 C",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, BTC-USD, RSST,SGOV",
+      "weights": "0.30, 0.15, 0.15, 0.10, 0.10,0.05, 0.10,0.05",
+      "strat": "Asymmetric RelDiff",
+      "thr": 38
+    },
+    {
+      "id": "15f76812-e079-4e23-873b-c03afa5782a9",
+      "name": "组合 D",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, BTC-USD, RSST",
+      "weights": "0.30, 0.15, 0.15, 0.10, 0.10,0.05, 0.15",
+      "strat": "Asymmetric RelDiff",
+      "thr": 38
+    }
+  ]
+}
