@@ -165,7 +165,7 @@ def month_to_date(m):
 # ============================================================
 TICKER_MAP = {
     "QQQM": "QQQM", "BRK-B": "BRK-B", "GLDM": "GLDM",
-    "XLE": "XLE", "DBMF": "DBMF", "KMLM": "KMLM", "BTC": "BTC-USD",
+    "XLE": "XLE", "DBMF": "DBMF", "KMLM": "KMLM", "BTC": "BTC",
 }
 ACTUAL_LABEL = "实际数据"
 ACTUAL_COLOR = "#000000"  # black
@@ -191,11 +191,8 @@ def fetch_actual_data():
             baseline_prices = close.iloc[0]
         else:
             baseline_prices = close.loc[baseline_mask].iloc[-1]
-        # Only keep US equity trading days (dates where at least one ETF has real data)
-        etf_cols = [c for c in close.columns if c != "BTC"]
-        us_trading_days = close[etf_cols].dropna(how="all").index
-        close = close.loc[close.index.isin(us_trading_days)]
-        # Forward-fill BTC gaps on ETF trading days
+        # Keep US trading days only (all tickers are now ARCA-listed)
+        close = close.dropna(how="all")
         close = close.ffill()
         # Cumulative return (%) from baseline
         returns_pct = ((close / baseline_prices) - 1) * 100
