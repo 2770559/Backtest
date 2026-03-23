@@ -144,13 +144,20 @@ ALL_SERIES = ASSETS + ["组合"]
 
 # War start date: 2/28/2026
 WAR_START = datetime(2026, 2, 28)
+# Prediction baseline: the last trading day when predictions were made (fixed, never moves)
+PREDICTION_BASELINE = datetime(2026, 3, 20)
 
 def month_to_date(m):
     """Convert month offset to real date string (YYYY-MM-DD).
-    If m matches the last actual trading day, return the exact trading date."""
-    if (ACTUAL_DATA is not None and not ACTUAL_DATA.empty
-            and LAST_ACTUAL_MONTH is not None and abs(m - LAST_ACTUAL_MONTH) < 0.001):
-        return ACTUAL_DATA.index[-1].strftime("%Y-%m-%d")
+    If m matches a known exact date (baseline or latest actual), return that date precisely."""
+    if BASELINE_MONTH is not None and abs(m - BASELINE_MONTH) < 0.001:
+        return PREDICTION_BASELINE.strftime("%Y-%m-%d")
+    # Match latest actual trading day exactly
+    if ACTUAL_DATA is not None and not ACTUAL_DATA.empty:
+        last_days = (ACTUAL_DATA.index[-1] - pd.Timestamp(WAR_START)).days
+        last_month = round(last_days / 30.44, 4)
+        if abs(m - last_month) < 0.001:
+            return ACTUAL_DATA.index[-1].strftime("%Y-%m-%d")
     return (WAR_START + timedelta(days=round(m * 30.44))).strftime("%Y-%m-%d")
 
 # ============================================================
@@ -163,7 +170,7 @@ TICKER_MAP = {
 ACTUAL_LABEL = "实际数据"
 ACTUAL_COLOR = "#000000"  # black
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def fetch_actual_data():
     """Fetch actual daily prices from yfinance and compute cumulative returns (%) from war-start baseline."""
     baseline_start = WAR_START - timedelta(days=5)  # fetch a few days before to get 2/27 close
@@ -290,22 +297,21 @@ st.markdown(kpi_html, unsafe_allow_html=True)
 if ACTUAL_DATA is not None and not ACTUAL_DATA.empty:
     last_date = ACTUAL_DATA.index[-1].strftime("%Y-%m-%d")
     last_portfolio = ACTUAL_DATA["组合"].dropna().iloc[-1]
-    st.caption(f"📡 实际数据最后交易日: **{last_date}** | 组合实际累计收益: **{last_portfolio:+.2f}%** | 数据缓存1小时自动刷新")
+    col_status, col_refresh = st.columns([0.85, 0.15])
+    with col_status:
+        st.caption(f"📡 实际数据最后交易日: **{last_date}** | 组合实际累计收益: **{last_portfolio:+.2f}%** | 数据缓存5分钟自动刷新")
+    with col_refresh:
+        if st.button("🔄 刷新数据"):
+            st.cache_data.clear()
+            st.rerun()
 else:
     st.warning("⚠️ 未能获取实际市场数据，图表仅显示预测数据")
 
 # ============================================================
 # HELPER: Build long-format DataFrame for Altair
 # ============================================================
-def _last_actual_month():
-    """Get the month offset of the last actual trading day, or None."""
-    if ACTUAL_DATA is None or ACTUAL_DATA.empty:
-        return None
-    last_date = ACTUAL_DATA.index[-1]
-    delta_days = (last_date - pd.Timestamp(WAR_START)).days
-    return round(delta_days / 30.44, 4)
-
-LAST_ACTUAL_MONTH = _last_actual_month()
+# Fixed baseline month offset (prediction baseline date, never moves)
+BASELINE_MONTH = round((PREDICTION_BASELINE - WAR_START).days / 30.44, 4)
 
 def _interpolate_scenario(data, all_months, series_list, scenario_name):
     """Interpolate a scenario's asset values at all unified month points."""
@@ -331,9 +337,8 @@ def _interpolate_scenario(data, all_months, series_list, scenario_name):
                 t = (m - m0) / (m1 - m0)
                 vals = {s: round(asset_vals[s][m0] * (1 - t) + asset_vals[s][m1] * t, 2)
                         for s in series_list}
-            if LAST_ACTUAL_MONTH is not None and abs(m - LAST_ACTUAL_MONTH) < 0.001:
-                actual_date = ACTUAL_DATA.index[-1].strftime("%m/%d")
-                label = f"最新交易日({actual_date})"
+            if BASELINE_MONTH is not None and abs(m - BASELINE_MONTH) < 0.001:
+                label = f"预测基准日({PREDICTION_BASELINE.strftime('%m/%d')})"
             else:
                 label = f"(插值 ≈{m:.1f}月)"
         result.append({"month": m, "label": label, **vals})
@@ -345,9 +350,14 @@ def build_long_df(scenario_keys, series_list):
     for sk in scenario_keys:
         for point in SCENARIOS[sk]:
             all_months.add(point["month"])
-    # Add last actual trading day so predictions are interpolated there too
-    if LAST_ACTUAL_MONTH is not None:
-        all_months.add(LAST_ACTUAL_MONTH)
+    # Add fixed baseline so predictions are interpolated there
+    if BASELINE_MONTH is not None:
+        all_months.add(BASELINE_MONTH)
+    # Add latest actual trading day so crosshair tooltip works on it
+    if ACTUAL_DATA is not None and not ACTUAL_DATA.empty:
+        last_actual_days = (ACTUAL_DATA.index[-1] - pd.Timestamp(WAR_START)).days
+        last_actual_month = round(last_actual_days / 30.44, 4)
+        all_months.add(last_actual_month)
     all_months = sorted(all_months)
 
     rows = []
@@ -369,46 +379,48 @@ def build_long_df(scenario_keys, series_list):
     df = pd.DataFrame(rows)
     df["日期"] = pd.to_datetime(df["日期"])
 
-    # Rebase predictions from actual data: ensure continuity at the transition point
+    # Rebase predictions: use fixed PREDICTION_BASELINE as the anchor point
+    baseline_ts = pd.Timestamp(PREDICTION_BASELINE)
     if ACTUAL_DATA is not None and not ACTUAL_DATA.empty:
-        last_actual_date = ACTUAL_DATA.index[-1]
-        last_actual_vals = ACTUAL_DATA.iloc[-1]
+        # Get actual values at the fixed baseline date (3/20)
+        baseline_idx = ACTUAL_DATA.index.get_indexer([baseline_ts], method="nearest")[0]
+        baseline_actual_vals = ACTUAL_DATA.iloc[baseline_idx] if 0 <= baseline_idx < len(ACTUAL_DATA) else None
 
-        # Step 1: Calculate offset for each (scenario, asset) at the transition point
-        # offset = actual_value - predicted_value at last actual date
-        offsets = {}
-        for sk in scenario_keys:
-            for s in series_list:
-                mask_transition = (
-                    (df["scenario_key"] == sk) & (df["资产"] == s) & (df["日期"] == last_actual_date)
-                )
-                pred_rows = df[mask_transition]
-                if not pred_rows.empty and s in ACTUAL_DATA.columns:
-                    predicted_val = pred_rows.iloc[0]["收益率(%)"]
-                    actual_val = last_actual_vals.get(s)
-                    if pd.notna(actual_val) and pd.notna(predicted_val):
-                        offsets[(sk, s)] = round(actual_val - predicted_val, 4)
+        if baseline_actual_vals is not None:
+            # Step 1: Calculate offset at FIXED baseline for each (scenario, asset)
+            offsets = {}
+            for sk in scenario_keys:
+                for s in series_list:
+                    mask_transition = (
+                        (df["scenario_key"] == sk) & (df["资产"] == s) & (df["日期"] == baseline_ts)
+                    )
+                    pred_rows = df[mask_transition]
+                    if not pred_rows.empty and s in ACTUAL_DATA.columns:
+                        predicted_val = pred_rows.iloc[0]["收益率(%)"]
+                        actual_val = baseline_actual_vals.get(s)
+                        if pd.notna(actual_val) and pd.notna(predicted_val):
+                            offsets[(sk, s)] = round(actual_val - predicted_val, 4)
 
-        # Step 2: Apply offset to all FUTURE prediction values (rebase from actual)
-        future_mask = df["日期"] > last_actual_date
-        for idx in df[future_mask].index:
-            sk = df.at[idx, "scenario_key"]
-            asset = df.at[idx, "资产"]
-            key = (sk, asset)
-            if key in offsets:
-                df.at[idx, "收益率(%)"] = round(df.at[idx, "收益率(%)"] + offsets[key], 2)
+            # Step 2: Apply offset to all dates AFTER baseline (rebase from actual at 3/20)
+            future_mask = df["日期"] > baseline_ts
+            for idx in df[future_mask].index:
+                sk = df.at[idx, "scenario_key"]
+                asset = df.at[idx, "资产"]
+                key = (sk, asset)
+                if key in offsets:
+                    df.at[idx, "收益率(%)"] = round(df.at[idx, "收益率(%)"] + offsets[key], 2)
 
-        # Step 3: Replace past dates (including transition point) with actual data
-        past_mask = df["日期"] <= last_actual_date
-        for idx in df[past_mask].index:
-            asset = df.at[idx, "资产"]
-            ts = df.at[idx, "日期"]
-            if asset in ACTUAL_DATA.columns:
-                ai = ACTUAL_DATA.index.get_indexer([ts], method="nearest")[0]
-                if 0 <= ai < len(ACTUAL_DATA):
-                    val = ACTUAL_DATA.iloc[ai][asset]
-                    if pd.notna(val):
-                        df.at[idx, "收益率(%)"] = round(val, 2)
+            # Step 3: Replace dates ON or BEFORE baseline with actual data
+            past_mask = df["日期"] <= baseline_ts
+            for idx in df[past_mask].index:
+                asset = df.at[idx, "资产"]
+                ts = df.at[idx, "日期"]
+                if asset in ACTUAL_DATA.columns:
+                    ai = ACTUAL_DATA.index.get_indexer([ts], method="nearest")[0]
+                    if 0 <= ai < len(ACTUAL_DATA):
+                        val = ACTUAL_DATA.iloc[ai][asset]
+                        if pd.notna(val):
+                            df.at[idx, "收益率(%)"] = round(val, 2)
     return df
 
 def build_chart(df, color_field, color_scale, title, height=500, zero_line=True,
