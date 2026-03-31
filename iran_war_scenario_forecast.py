@@ -170,18 +170,36 @@ TICKER_MAP = {
 ACTUAL_LABEL = "实际数据"
 ACTUAL_COLOR = "#000000"  # black
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def fetch_actual_data():
     """Fetch actual daily prices from yfinance and compute cumulative returns (%) from war-start baseline."""
     baseline_start = WAR_START - timedelta(days=5)  # fetch a few days before to get 2/27 close
     tickers = list(TICKER_MAP.values())
+    raw = None
+    for attempt in range(3):
+        try:
+            raw = yf.download(tickers, start=baseline_start.strftime("%Y-%m-%d"),
+                              end=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+                              auto_adjust=True, progress=False)
+            if raw is not None and not raw.empty:
+                break
+        except Exception:
+            import time
+            time.sleep(2 * (attempt + 1))
     try:
-        raw = yf.download(tickers, start=baseline_start.strftime("%Y-%m-%d"),
-                          end=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
-                          auto_adjust=True, progress=False)
-        if raw.empty:
+        if raw is None or raw.empty:
             return None
-        close = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw
+        # Handle yfinance column structure (varies by version)
+        if isinstance(raw.columns, pd.MultiIndex):
+            level0 = raw.columns.get_level_values(0).unique().tolist()
+            if "Close" in level0:
+                close = raw["Close"]
+            elif "Price" in level0:
+                close = raw["Price"]
+            else:
+                close = raw.xs("Close", level=1, axis=1) if "Close" in raw.columns.get_level_values(1).unique() else raw
+        else:
+            close = raw
         # Rename columns back to our asset names
         rename = {v: k for k, v in TICKER_MAP.items()}
         close = close.rename(columns=rename)
