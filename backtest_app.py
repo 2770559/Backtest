@@ -390,8 +390,8 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
 
         elif strategy_name == STRAT_ASYM:
             diff_ratio = (current_weights - target_weights) / target_weights.replace(0, 1e-9)
-            mask_major = target_weights >= 0.1
-            mask_minor = target_weights < 0.1
+            mask_major = target_weights >= 0.06
+            mask_minor = target_weights < 0.06
 
             trigger_major = mask_major & (np.abs(diff_ratio) > threshold)
             trigger_minor_up = mask_minor & (diff_ratio > threshold * 2.5)
@@ -571,11 +571,22 @@ with st.sidebar:
             loaded_config = json.load(uploaded_file)
             if st.button(":material/upload: Apply Config", use_container_width=True):
                 st.session_state.portfolios_list = loaded_config.get("portfolios", [])
+                strat_legacy_map = {
+                    "买入持有": STRAT_BH,
+                    "定期再平衡(年)": STRAT_ANNUAL,
+                    "定期再平衡(半年)": STRAT_SEMI,
+                    "相对差局部再平衡": STRAT_RD_LOCAL,
+                    "相对差混合再平衡": STRAT_RD_MIXED,
+                    "相对差全局再平衡": STRAT_RD_FULL,
+                    "不对称相对差再平衡": STRAT_ASYM,
+                }
                 for p in st.session_state.portfolios_list:
                     if 'id' not in p: p['id'] = str(uuid.uuid4())
+                    if p.get('strat') in strat_legacy_map:
+                        p['strat'] = strat_legacy_map[p['strat']]
                 st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
                 st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
-                st.session_state['init_funds'] = loaded_config.get("initial_funds", 10000)
+                st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
                 st.rerun()
         except Exception as e:
             st.error(f"Parse error: {e}")
