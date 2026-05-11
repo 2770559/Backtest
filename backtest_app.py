@@ -137,6 +137,7 @@ h1, h2, h3, h4 { letter-spacing: -0.02em; }
 .cmp-table tr:hover td { background: #f8fafc; }
 .cmp-table .best { color: #10b981; font-weight: 700; }
 .cmp-table .worst { color: #ef4444; }
+.cmp-table .cagr-row td { background: #f8fafc; font-weight: 600; border-top: 2px solid #e2e8f0; }
 
 /* ===== Portfolio Config Cards ===== */
 .config-card {
@@ -531,6 +532,101 @@ def render_comparison_table(metrics):
     st.markdown(f'<table class="cmp-table">{header}{rows}</table>', unsafe_allow_html=True)
 
 
+def compute_annual_returns(comp_df):
+    """For each calendar year present in comp_df, compute return per column.
+    Returns list of dicts: {year, returns: {col_name: pct}, partial: bool, start_date, end_date}.
+    """
+    if comp_df is None or comp_df.empty:
+        return []
+    first_date, last_date = comp_df.index[0], comp_df.index[-1]
+    yearly_last = comp_df.resample('YE').last()
+    years = sorted({d.year for d in comp_df.index})
+    rows = []
+    for y in years:
+        if y == years[-1]:
+            end_row = comp_df.iloc[-1]
+            end_date = last_date
+        else:
+            mask = yearly_last.index.year == y
+            if not mask.any():
+                continue
+            end_row = yearly_last.loc[mask].iloc[0]
+            end_date = yearly_last.index[mask][0]
+
+        if y == years[0]:
+            start_row = comp_df.iloc[0]
+            start_date = first_date
+            partial_first = not (first_date.month == 1 and first_date.day <= 7)
+        else:
+            prev_mask = yearly_last.index.year == (y - 1)
+            if not prev_mask.any():
+                continue
+            start_row = yearly_last.loc[prev_mask].iloc[0]
+            start_date = yearly_last.index[prev_mask][0]
+            partial_first = False
+
+        partial_last = (y == years[-1]) and not (last_date.month == 12 and last_date.day >= 25)
+        partial = partial_first or partial_last
+
+        rets = {}
+        for col in comp_df.columns:
+            s = start_row[col]
+            e = end_row[col]
+            if pd.isna(s) or pd.isna(e) or s == 0:
+                rets[col] = None
+            else:
+                rets[col] = (e / s) - 1
+        rows.append({"year": y, "returns": rets, "partial": partial,
+                     "start_date": start_date, "end_date": end_date})
+    return rows
+
+
+def render_annual_returns_table(comp_df, metrics):
+    """HTML table: rows = calendar years (newest first) + CAGR; cols = each series in comp_df."""
+    rows_data = compute_annual_returns(comp_df)
+    if not rows_data:
+        return
+    cols = list(comp_df.columns)
+
+    header = "<tr><th>Year</th>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
+
+    body = ""
+    for r in sorted(rows_data, key=lambda x: -x["year"]):
+        raw_vals = [r["returns"][c] for c in cols]
+        valid = [v for v in raw_vals if v is not None]
+        hi, lo = (max(valid), min(valid)) if len(valid) >= 2 else (None, None)
+        year_lbl = f"{r['year']}*" if r["partial"] else str(r["year"])
+        body += f"<tr><td><strong>{year_lbl}</strong></td>"
+        for v in raw_vals:
+            if v is None:
+                body += "<td>-</td>"
+            else:
+                cls = "best" if v == hi else ("worst" if v == lo else "")
+                body += f'<td class="{cls}">{v:+.2%}</td>'
+        body += "</tr>"
+
+    # CAGR row — reuse _ann_ret from metrics so it matches KPI cards byte-for-byte
+    name_to_ann = {m["name"]: m.get("_ann_ret") for m in metrics}
+    cagr_vals = [name_to_ann.get(c) for c in cols]
+    valid = [v for v in cagr_vals if isinstance(v, (int, float))]
+    hi, lo = (max(valid), min(valid)) if len(valid) >= 2 else (None, None)
+    body += '<tr class="cagr-row"><td><strong>CAGR</strong></td>'
+    for v in cagr_vals:
+        if not isinstance(v, (int, float)):
+            body += "<td>-</td>"
+        else:
+            cls = "best" if v == hi else ("worst" if v == lo else "")
+            body += f'<td class="{cls}">{v:+.2%}</td>'
+    body += "</tr>"
+
+    st.markdown(f'<table class="cmp-table">{header}{body}</table>', unsafe_allow_html=True)
+
+    partial_rows = [r for r in rows_data if r["partial"]]
+    if partial_rows:
+        parts = [f"{r['year']} = {r['start_date'].date()}→{r['end_date'].date()}" for r in partial_rows]
+        st.caption("*Partial year. Coverage: " + "; ".join(parts) + ".")
+
+
 # --- 3. Sidebar: Global Settings ---
 with st.sidebar:
     st.markdown("### Settings")
@@ -887,3 +983,8 @@ if st.session_state.run_backtest:
                 with tab:
                     st.caption(f"Start: {actual_start_day.date()}")
                     st.dataframe(res_list[lbl].style.apply(style_row, axis=1).format({"NAV": "{:,.2f}"}), use_container_width=True)
+
+        # --- Annual Returns by Calendar Year ---
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        with st.expander("Annual Returns by Calendar Year", expanded=True):
+            render_annual_returns_table(comp_df, metrics)
