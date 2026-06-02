@@ -774,6 +774,30 @@ if st.session_state.run_backtest:
         for tk in all_tks:
             if tk not in price_data.columns: price_data[tk] = np.nan
 
+        # --- Scrub corrupted leading prints (IPO / listing-day scale glitches) ---
+        # Some sources (Yahoo) record a security's first trading day at the wrong
+        # scale, e.g. 511130.SS listing day = 0.97 vs ~97 thereafter (a 100x error).
+        # If the initial buy is anchored on such a print, the next day's correction
+        # fabricates a ~100x gain that blows up portfolio NAV. Drop any leading print
+        # whose step to the next valid print is physically impossible for these
+        # instruments (>=5x up or <=0.2x down in a single observation); the existing
+        # bfill below then anchors the buy on the first clean price.
+        scrubbed = []
+        for tk in price_data.columns:
+            valid = price_data[tk].dropna()
+            guard = 0
+            while len(valid) >= 2 and guard < 3:
+                p1, p2 = valid.iloc[0], valid.iloc[1]
+                if p1 > 0 and (p2 / p1 >= 5 or p2 / p1 <= 0.2):
+                    price_data.loc[valid.index[0], tk] = np.nan
+                    scrubbed.append(f"{tk} {valid.index[0].date()} ({p1:.4g}->{p2:.4g})")
+                    valid = valid.iloc[1:]
+                    guard += 1
+                else:
+                    break
+        if scrubbed:
+            st.warning("Dropped corrupted listing-day price(s): " + "; ".join(scrubbed))
+
         bench_tk = clean_ticker(bench_in)
         if bench_tk not in price_data.columns: st.error(f"Benchmark {bench_tk} not found."); st.stop()
 
