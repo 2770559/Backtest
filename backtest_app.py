@@ -6,10 +6,20 @@ import altair as alt
 import uuid
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
+
+from backtest_core import (
+    STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
+    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
+    STRAT_LEGACY_MAP,
+    clean_ticker, parse_portfolio, calculate_metrics,
+    run_detailed_backtest, compute_annual_returns,
+    scrub_leading_glitches, scrub_isolated_spikes,
+)
 
 # --- Version ---
-APP_VERSION = "1.1.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-03-11"
+APP_VERSION = "1.2.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-06-10"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -243,15 +253,6 @@ if 'bi' not in st.session_state: st.session_state['bi'] = "SPY"
 if 'sd' not in st.session_state: st.session_state['sd'] = datetime(2020, 1, 1)
 if 'init_funds' not in st.session_state: st.session_state['init_funds'] = 10000
 
-# Strategy name constants
-STRAT_BH       = "Buy & Hold"
-STRAT_ANNUAL   = "Periodic (Annual)"       # Rebalance every 365 days
-STRAT_SEMI     = "Periodic (Semi-Annual)"  # Rebalance every 180 days
-STRAT_RD_LOCAL = "RelDiff Local"           # Relative-diff local rebalance
-STRAT_RD_MIXED = "RelDiff Mixed"           # Relative-diff mixed rebalance
-STRAT_RD_FULL  = "RelDiff Full"            # Relative-diff global rebalance
-STRAT_ASYM     = "Asymmetric RelDiff"      # Asymmetric relative-diff rebalance
-
 if 'portfolios_list' not in st.session_state:
     st.session_state.portfolios_list = [
         {
@@ -276,168 +277,25 @@ def delete_portfolio(idx):
     if 0 <= idx < len(st.session_state.portfolios_list):
         st.session_state.portfolios_list.pop(idx)
 
-# --- 2. Core Algorithms ---
-def clean_ticker(t):
-    t = t.strip().upper()
-    mapping = {"BRK.B": "BRK-B", "ETHUSD": "ETH-USD", "BTCUSD": "BTC-USD"}
-    return mapping.get(t, t)
+# --- 2. Data Fetch & Validation Helpers ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_price_history(tickers, start):
+    """Cached wrapper around yf.download so widget interactions don't re-hit Yahoo."""
+    return yf.download(list(tickers), start=start, progress=False)
 
-def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
-    empty = {"final_nav": "-", "total_ret": "-", "ann_ret": "-", "max_dd": "-", "sharpe": "-", "rebal_cnt": "-",
-             "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
-    if nav_series is None or nav_series.empty or len(nav_series) < 2:
-        return empty
-    try:
-        nav = nav_series.dropna()
-        if len(nav) < 2: return empty
-        total_return = (nav.iloc[-1] / nav.iloc[0]) - 1
-        days = (nav.index[-1] - nav.index[0]).days
-        if days <= 0: return empty
-        years = days / 365.25
-        ann_return = (1 + total_return) ** (1 / years) - 1
-        rolling_max = nav.cummax()
-        max_dd = ((nav - rolling_max) / rolling_max).min()
-        daily_ret = nav.pct_change().dropna()
-        median_gap = np.median(np.diff(nav.index).astype('timedelta64[D]').astype(int))
-        if median_gap <= 5:
-            ann_factor = 252
-        elif median_gap <= 10:
-            ann_factor = 52
-        else:
-            ann_factor = 12
-        ann_vol = daily_ret.std() * np.sqrt(ann_factor)
-        sharpe = (ann_return - risk_free_rate) / ann_vol if ann_vol > 0 else 0
-        return {
-            "final_nav": f"{nav.iloc[-1]:,.2f}",
-            "total_ret": f"{total_return:.2%}",
-            "ann_ret": f"{ann_return:.2%}",
-            "max_dd": f"{max_dd:.2%}",
-            "sharpe": f"{sharpe:.2f}",
-            "rebal_cnt": int(rebalance_count),
-            "_total_ret": total_return,
-            "_ann_ret": ann_return,
-            "_max_dd": max_dd,
-            "_sharpe": sharpe,
-        }
-    except Exception:
-        return {"final_nav": "Err", "total_ret": "Err", "ann_ret": "Err", "max_dd": "Err", "sharpe": "Err", "rebal_cnt": "Err",
-                "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
-
-def apply_local_rebalance(asset_values, target_weights, threshold):
-    total_val = asset_values.sum()
-    current_vals = asset_values.copy()
-    reset_indices = []
-    safe_targets = target_weights.replace(0, 1e-9)
-    for _ in range(10):
-        current_weights = current_vals / total_val
-        rel_diffs = np.abs(current_weights - target_weights) / safe_targets
-        to_trigger = (rel_diffs > threshold) & (~current_vals.index.isin(reset_indices))
-        if not to_trigger.any(): break
-        triggered_indices = to_trigger.index[to_trigger].tolist()
-        reset_indices.extend(triggered_indices)
-        for idx in triggered_indices: current_vals[idx] = target_weights[idx] * total_val
-        rem_indices = [i for i in current_vals.index if i not in reset_indices]
-        if not rem_indices: return total_val * target_weights
-        rem_cash = total_val - current_vals[reset_indices].sum()
-        current_rem_sum = asset_values[rem_indices].sum()
-        if current_rem_sum > 0: ratios = asset_values[rem_indices] / current_rem_sum
-        else: ratios = target_weights[rem_indices] / target_weights[rem_indices].sum()
-        current_vals[rem_indices] = ratios * rem_cash
-    return current_vals
-
-def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, threshold):
-    tickers = price_df.columns
-    if price_df.empty: return pd.DataFrame(), 0, {}
-    start_prices = price_df.iloc[0]
-    if start_prices.isna().any():
-        start_prices = price_df.bfill().iloc[0]
-        if start_prices.isna().any(): return pd.DataFrame(), 0, {}
-
-    current_shares = (initial_cap * target_weights) / start_prices
-    history = []
-    last_rebalance_date = price_df.index[0]
-    rebalance_count = 0
-    price_df_filled = price_df.ffill()
-
-    cumulative_pnl = pd.Series(0.0, index=tickers)
-    prev_prices = start_prices
-
-    for i in range(len(price_df)):
-        current_date = price_df.index[i]
-        current_prices = price_df_filled.iloc[i]
-
-        if i > 0: cumulative_pnl += current_shares * (current_prices - prev_prices)
-        prev_prices = current_prices
-
-        asset_values = current_shares * current_prices
-        total_val = asset_values.sum()
-        if total_val == 0 or np.isnan(total_val): continue
-        current_weights = asset_values / total_val
-
-        if i == 0:
-            rec = {"Date": current_date, "Type": "Init", "NAV": total_val}
-            rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
-            history.append(rec); continue
-
-        do_rebalance = False
-        new_values = asset_values.copy()
-
-        if strategy_name == STRAT_ANNUAL:
-            if (current_date - last_rebalance_date).days >= 365:
-                new_values, do_rebalance = total_val * target_weights, True
-        elif strategy_name == STRAT_SEMI:
-            if (current_date - last_rebalance_date).days >= 180:
-                new_values, do_rebalance = total_val * target_weights, True
-
-        elif strategy_name == STRAT_ASYM:
-            diff_ratio = (current_weights - target_weights) / target_weights.replace(0, 1e-9)
-            mask_major = target_weights >= 0.06
-            mask_minor = target_weights < 0.06
-
-            trigger_major = mask_major & (np.abs(diff_ratio) > threshold)
-            trigger_minor_up = mask_minor & (diff_ratio > threshold * 2.5)
-            trigger_minor_down = mask_minor & (diff_ratio < -threshold * 1.25)
-
-            if trigger_major.any() or trigger_minor_up.any() or trigger_minor_down.any():
-                new_values = total_val * target_weights
-                do_rebalance = True
-
-        elif "RelDiff" in strategy_name:
-            rel_diffs = np.abs(current_weights - target_weights) / target_weights.replace(0, 1e-9)
-            if rel_diffs.max() > threshold:
-                if strategy_name == STRAT_RD_FULL:
-                    new_values = total_val * target_weights
-                    do_rebalance = True
-                elif strategy_name == STRAT_RD_MIXED:
-                    if ((target_weights >= 0.1) & (rel_diffs > threshold)).any():
-                        new_values = total_val * target_weights
-                    else:
-                        new_values = apply_local_rebalance(asset_values, target_weights, threshold)
-                    do_rebalance = True
-                elif strategy_name == STRAT_RD_LOCAL:
-                    new_values = apply_local_rebalance(asset_values, target_weights, threshold)
-                    do_rebalance = True
-
-        if do_rebalance:
-            rebalance_count += 1
-            pre_rec = {"Date": current_date, "Type": "Pre-Rebal", "NAV": total_val}
-            pre_rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
-            history.append(pre_rec)
-            current_shares, last_rebalance_date = new_values / current_prices, current_date
-            post_rec = {"Date": current_date, "Type": "Post-Rebal", "NAV": total_val}
-            post_rec.update({f"{t}": f"{(new_values/total_val)[t]:.2%}" for t in tickers})
-            history.append(post_rec)
-        else:
-            rec = {"Date": current_date, "Type": "Hold", "NAV": total_val}
-            rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
-            history.append(rec)
-
-    total_pnl = cumulative_pnl.sum()
-    pct_pnl = cumulative_pnl / total_pnl if total_pnl != 0 else cumulative_pnl * 0
-    pnl_rec = {"Date": "Overall", "Type": "PnL Contrib%", "NAV": float(total_pnl)}
-    pnl_rec.update({f"{t}": f"{pct_pnl[t]:.2%}" for t in tickers})
-
-    return pd.DataFrame(history), rebalance_count, pnl_rec
+def validate_inputs(portfolios, benchmark):
+    """Validate benchmark + all portfolio configs. Returns list of error messages."""
+    errors = []
+    if not str(benchmark).strip():
+        errors.append("Benchmark ticker is empty")
+    names = [p['name'] for p in portfolios]
+    dup_names = sorted({n for n in names if names.count(n) > 1})
+    if dup_names:
+        errors.append("Duplicate portfolio names: " + ", ".join(dup_names))
+    for p in portfolios:
+        _, _, perrs = parse_portfolio(p)
+        errors.extend(f"**{p['name']}**: {e}" for e in perrs)
+    return errors
 
 @st.cache_data(ttl=86400)
 def fetch_cpi_data():
@@ -532,55 +390,6 @@ def render_comparison_table(metrics):
     st.markdown(f'<table class="cmp-table">{header}{rows}</table>', unsafe_allow_html=True)
 
 
-def compute_annual_returns(comp_df):
-    """For each calendar year present in comp_df, compute return per column.
-    Returns list of dicts: {year, returns: {col_name: pct}, partial: bool, start_date, end_date}.
-    """
-    if comp_df is None or comp_df.empty:
-        return []
-    first_date, last_date = comp_df.index[0], comp_df.index[-1]
-    yearly_last = comp_df.resample('YE').last()
-    years = sorted({d.year for d in comp_df.index})
-    rows = []
-    for y in years:
-        if y == years[-1]:
-            end_row = comp_df.iloc[-1]
-            end_date = last_date
-        else:
-            mask = yearly_last.index.year == y
-            if not mask.any():
-                continue
-            end_row = yearly_last.loc[mask].iloc[0]
-            end_date = yearly_last.index[mask][0]
-
-        if y == years[0]:
-            start_row = comp_df.iloc[0]
-            start_date = first_date
-            partial_first = not (first_date.month == 1 and first_date.day <= 7)
-        else:
-            prev_mask = yearly_last.index.year == (y - 1)
-            if not prev_mask.any():
-                continue
-            start_row = yearly_last.loc[prev_mask].iloc[0]
-            start_date = yearly_last.index[prev_mask][0]
-            partial_first = False
-
-        partial_last = (y == years[-1]) and not (last_date.month == 12 and last_date.day >= 25)
-        partial = partial_first or partial_last
-
-        rets = {}
-        for col in comp_df.columns:
-            s = start_row[col]
-            e = end_row[col]
-            if pd.isna(s) or pd.isna(e) or s == 0:
-                rets[col] = None
-            else:
-                rets[col] = (e / s) - 1
-        rows.append({"year": y, "returns": rets, "partial": partial,
-                     "start_date": start_date, "end_date": end_date})
-    return rows
-
-
 def render_annual_returns_table(comp_df, metrics):
     """HTML table: rows = calendar years (newest first) + CAGR; cols = each series in comp_df."""
     rows_data = compute_annual_returns(comp_df)
@@ -628,6 +437,28 @@ def render_annual_returns_table(comp_df, metrics):
 
 
 # --- 3. Sidebar: Global Settings ---
+SAVED_CONFIG_DIR = Path(__file__).parent / "Backtest"
+VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM}
+
+def apply_config(loaded_config):
+    """Apply an imported/saved config dict to session state and rerun."""
+    st.session_state.portfolios_list = loaded_config.get("portfolios", [])
+    for p in st.session_state.portfolios_list:
+        if 'id' not in p: p['id'] = str(uuid.uuid4())
+        p.setdefault('name', 'Port ?')
+        p.setdefault('tickers', '')
+        p.setdefault('weights', '')
+        p.setdefault('thr', 38)
+        if p.get('strat') in STRAT_LEGACY_MAP:
+            p['strat'] = STRAT_LEGACY_MAP[p['strat']]
+        if p.get('strat') not in VALID_STRATS:
+            p['strat'] = STRAT_ASYM
+    st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
+    st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
+    st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
+    st.session_state.run_backtest = False  # require explicit Analyze on new config
+    st.rerun()
+
 with st.sidebar:
     st.markdown("### Settings")
 
@@ -638,7 +469,9 @@ with st.sidebar:
         min_value=datetime(1970, 1, 1).date(),
         max_value=datetime.today().date()
     )
-    init_f = st.number_input("Initial Investment ($)", value=st.session_state['init_funds'], step=1000)
+    init_f = st.number_input("Initial Investment ($)", min_value=100, value=st.session_state['init_funds'], step=1000)
+    rf_pct = st.number_input("Risk-free Rate (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25, format="%.2f")
+    rf_rate = rf_pct / 100.0
 
     st.session_state['bi'] = bench_in
     st.session_state['sd'] = start_d
@@ -650,6 +483,16 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### Config I/O")
+
+    saved_files = sorted(SAVED_CONFIG_DIR.glob("*.json")) if SAVED_CONFIG_DIR.is_dir() else []
+    if saved_files:
+        sel_saved = st.selectbox("Saved Configs", saved_files, format_func=lambda p: p.stem)
+        if st.button(":material/folder_open: Load Saved Config", width="stretch"):
+            try:
+                apply_config(json.loads(sel_saved.read_text(encoding="utf-8")))
+            except Exception as e:
+                st.error(f"Load error: {e}")
+
     current_config = {
         "benchmark": st.session_state['bi'],
         "start_date": str(st.session_state['sd']),
@@ -657,33 +500,14 @@ with st.sidebar:
         "portfolios": st.session_state.portfolios_list
     }
     json_str = json.dumps(current_config, indent=2, ensure_ascii=False)
-    col_io1, col_io2 = st.columns(2)
-    with col_io1:
-        st.download_button(label=":material/download: Export", data=json_str, file_name="backtest_config.json", mime="application/json", use_container_width=True)
+    st.download_button(label=":material/download: Export", data=json_str, file_name="backtest_config.json", mime="application/json", width="stretch")
 
     uploaded_file = st.file_uploader("Import Config", type=["json"], label_visibility="collapsed")
     if uploaded_file is not None:
         try:
             loaded_config = json.load(uploaded_file)
-            if st.button(":material/upload: Apply Config", use_container_width=True):
-                st.session_state.portfolios_list = loaded_config.get("portfolios", [])
-                strat_legacy_map = {
-                    "买入持有": STRAT_BH,
-                    "定期再平衡(年)": STRAT_ANNUAL,
-                    "定期再平衡(半年)": STRAT_SEMI,
-                    "相对差局部再平衡": STRAT_RD_LOCAL,
-                    "相对差混合再平衡": STRAT_RD_MIXED,
-                    "相对差全局再平衡": STRAT_RD_FULL,
-                    "不对称相对差再平衡": STRAT_ASYM,
-                }
-                for p in st.session_state.portfolios_list:
-                    if 'id' not in p: p['id'] = str(uuid.uuid4())
-                    if p.get('strat') in strat_legacy_map:
-                        p['strat'] = strat_legacy_map[p['strat']]
-                st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
-                st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
-                st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
-                st.rerun()
+            if st.button(":material/upload: Apply Config", width="stretch"):
+                apply_config(loaded_config)
         except Exception as e:
             st.error(f"Parse error: {e}")
 
@@ -717,7 +541,7 @@ for i, port in enumerate(st.session_state.portfolios_list):
 
 btn_cols = st.columns([1, 1.5, 5.5])
 with btn_cols[0]:
-    if st.button(":material/add_circle: Add", use_container_width=True):
+    if st.button(":material/add_circle: Add", width="stretch"):
         existing_names = set(p["name"] for p in st.session_state.portfolios_list)
         new_char_code = 65
         while f"Port {chr(new_char_code)}" in existing_names: new_char_code += 1
@@ -729,74 +553,54 @@ with btn_cols[0]:
         })
         st.rerun()
 with btn_cols[1]:
-    run_clicked = st.button(":material/play_arrow: Analyze", type="primary", use_container_width=True)
+    run_clicked = st.button(":material/play_arrow: Analyze", type="primary", width="stretch")
     if run_clicked:
-        validation_pass = True
-        error_msgs = []
-        for p in st.session_state.portfolios_list:
-            t_str = p['tickers'].replace("\uff0c", ",")  # fullwidth comma
-            w_str = p['weights'].replace("\uff0c", ",")
-            t_list = [x.strip() for x in t_str.split(',') if x.strip()]
-            w_list = [x.strip() for x in w_str.split(',') if x.strip()]
-            if len(t_list) != len(w_list):
-                validation_pass = False
-                error_msgs.append(f"**{p['name']}**: {len(t_list)} tickers vs {len(w_list)} weights")
-                continue
-            try:
-                w_floats = [float(w) for w in w_list]
-                total_w = sum(w_floats)
-                if abs(total_w - 1.0) > 0.01:
-                    validation_pass = False
-                    error_msgs.append(f"**{p['name']}**: weights sum = {total_w:.2f}, should be 1.0")
-            except ValueError:
-                validation_pass = False
-                error_msgs.append(f"**{p['name']}**: invalid weight format")
-        if validation_pass:
+        error_msgs = validate_inputs(st.session_state.portfolios_list, bench_in)
+        if not error_msgs:
             st.session_state.run_backtest = True
         else:
+            st.session_state.run_backtest = False
             for msg in error_msgs: st.error(msg)
 
 st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
 # --- 5. Results ---
 if st.session_state.run_backtest:
+    # Re-validate on every rerun: once run_backtest is set, any widget edit reruns
+    # this block with current (possibly invalid) inputs, bypassing the button gate.
+    revalidate_errs = validate_inputs(st.session_state.portfolios_list, bench_in)
+    if revalidate_errs:
+        for msg in revalidate_errs: st.error(msg)
+        st.stop()
+
+    parsed_ports = []
+    for p in st.session_state.portfolios_list:
+        p_tks, p_wts, _ = parse_portfolio(p)
+        parsed_ports.append((p, p_tks, p_wts))
+
     with st.spinner('Fetching data & running backtest...'):
-        all_tks = list(set([clean_ticker(bench_in)] + [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].replace("\uff0c", ",").split(",")]))
+        all_tks = sorted(set([clean_ticker(bench_in)] + [t for _, p_tks, _ in parsed_ports for t in p_tks]))
         try:
-            df_raw = yf.download(all_tks, start=start_d - timedelta(days=20), progress=False)
+            df_raw = fetch_price_history(tuple(all_tks), str(start_d - timedelta(days=20)))
         except Exception as e:
             st.error(f"Download error: {e}"); st.stop()
-        if df_raw.empty: st.error("Download failed."); st.stop()
+        if df_raw is None or df_raw.empty: st.error("Download failed."); st.stop()
 
-        if 'Adj Close' in df_raw.columns.get_level_values(0): price_data = df_raw['Adj Close']
-        elif 'Close' in df_raw.columns.get_level_values(0): price_data = df_raw['Close']
-        else: price_data = df_raw
+        if 'Adj Close' in df_raw.columns.get_level_values(0): price_data = df_raw['Adj Close'].copy()
+        elif 'Close' in df_raw.columns.get_level_values(0): price_data = df_raw['Close'].copy()
+        else: price_data = df_raw.copy()
         for tk in all_tks:
             if tk not in price_data.columns: price_data[tk] = np.nan
 
-        # --- Scrub corrupted leading prints (IPO / listing-day scale glitches) ---
-        # Some sources (Yahoo) record a security's first trading day at the wrong
-        # scale, e.g. 511130.SS listing day = 0.97 vs ~97 thereafter (a 100x error).
-        # If the initial buy is anchored on such a print, the next day's correction
-        # fabricates a ~100x gain that blows up portfolio NAV. Drop any leading print
-        # whose step to the next valid print is physically impossible for these
-        # instruments (>=5x up or <=0.2x down in a single observation); the existing
-        # bfill below then anchors the buy on the first clean price.
-        scrubbed = []
-        for tk in price_data.columns:
-            valid = price_data[tk].dropna()
-            guard = 0
-            while len(valid) >= 2 and guard < 3:
-                p1, p2 = valid.iloc[0], valid.iloc[1]
-                if p1 > 0 and (p2 / p1 >= 5 or p2 / p1 <= 0.2):
-                    price_data.loc[valid.index[0], tk] = np.nan
-                    scrubbed.append(f"{tk} {valid.index[0].date()} ({p1:.4g}->{p2:.4g})")
-                    valid = valid.iloc[1:]
-                    guard += 1
-                else:
-                    break
+        # Scrub data glitches: corrupted listing-day prints (wrong scale on day 1)
+        # and isolated mid-series spikes that revert on the next print. Genuine
+        # multi-print moves are never touched. See backtest_core for details.
+        scrubbed = scrub_leading_glitches(price_data)
+        spiked = scrub_isolated_spikes(price_data)
         if scrubbed:
             st.warning("Dropped corrupted listing-day price(s): " + "; ".join(scrubbed))
+        if spiked:
+            st.warning("Dropped isolated mid-series price glitch(es): " + "; ".join(spiked))
 
         bench_tk = clean_ticker(bench_in)
         if bench_tk not in price_data.columns: st.error(f"Benchmark {bench_tk} not found."); st.stop()
@@ -812,7 +616,7 @@ if st.session_state.run_backtest:
         df_aligned = df_aligned[df_aligned.index >= market_start_day]
         df_filled = df_aligned.ffill().bfill()
 
-        all_port_tks = [clean_ticker(t) for p in st.session_state.portfolios_list for t in p['tickers'].replace("\uff0c", ",").split(",")]
+        all_port_tks = sorted({t for _, p_tks, _ in parsed_ports for t in p_tks})
         raw_aligned = df_aligned[all_port_tks]
         first_valid_idx = raw_aligned.apply(lambda x: x.first_valid_index())
         bottleneck_date = first_valid_idx.max()
@@ -823,15 +627,14 @@ if st.session_state.run_backtest:
         if days_diff_bench > 7:
             st.warning(f"Benchmark **{bench_tk}** not listed until {market_start_day.date()}, start date adjusted.")
         elif days_diff_bench > 0:
-            if pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7:
-                actual_start_day = bottleneck_date
-                st.warning(f"**{bottleneck_ticker}** listed late ({bottleneck_date.date()}), start date aligned.")
-            else:
-                st.info(f"Aligned to next trading day: {market_start_day.date()}")
-        else:
-            if pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7:
-                actual_start_day = bottleneck_date
-                st.warning(f"**{bottleneck_ticker}** listed late ({bottleneck_date.date()}), start date adjusted.")
+            st.info(f"Aligned to next trading day: {market_start_day.date()}")
+
+        # Must run regardless of how late the benchmark listed: any portfolio asset
+        # listing after the start would otherwise be bfilled into flat fabricated
+        # prices for the whole pre-listing stretch.
+        if pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7:
+            actual_start_day = bottleneck_date
+            st.warning(f"**{bottleneck_ticker}** listed late ({bottleneck_date.date()}), start date adjusted.")
 
         final_data = df_filled[df_filled.index >= actual_start_day]
         if final_data.empty: st.error("Insufficient data."); st.stop()
@@ -858,17 +661,21 @@ if st.session_state.run_backtest:
                 if tk in target: return name
             return target
 
-        for p in st.session_state.portfolios_list:
-            t_str = p['tickers'].replace("\uff0c", ",")
-            w_str = p['weights'].replace("\uff0c", ",")
-            p_tks = [clean_ticker(t) for t in t_str.split(",")]
-            p_wts = [float(w) for w in w_str.split(",")]
+        for p, p_tks, p_wts in parsed_ports:
             valid_p_tks = [t for t in p_tks if t in price_df.columns and not price_df[t].isna().all()]
-            if not valid_p_tks: continue
-            if len(valid_p_tks) < len(p_tks):
-                w_series = pd.Series(p_wts[:len(p_tks)], index=p_tks)[valid_p_tks]
+            dropped_tks = [t for t in p_tks if t not in valid_p_tks]
+            if not valid_p_tks:
+                st.error(f"**{p['name']}**: no usable data for any ticker ({', '.join(p_tks)}) \u2014 portfolio skipped.")
+                continue
+            w_series = pd.Series(p_wts, index=p_tks)
+            if dropped_tks:
+                w_series = w_series[valid_p_tks]
                 w_series = w_series / w_series.sum()
-            else: w_series = pd.Series(p_wts, index=p_tks)
+                st.warning(
+                    f"**{p['name']}**: no data for **{', '.join(dropped_tks)}** \u2014 dropped from portfolio; "
+                    "remaining weights renormalized: "
+                    + ", ".join(f"{t} {w:.1%}" for t, w in w_series.items())
+                )
 
             res_df, cnt, pnl_rec = run_detailed_backtest(p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0)
             if not res_df.empty:
@@ -902,7 +709,7 @@ if st.session_state.run_backtest:
                     yearly_inf.append({"Year": y, "Inflation(%)": round(rate, 2)})
                 inf_df = pd.DataFrame(yearly_inf)
                 with st.expander("CPI Inflation Rates (editable)", expanded=False):
-                    edited_inf = st.data_editor(inf_df, hide_index=True, use_container_width=True)
+                    edited_inf = st.data_editor(inf_df, hide_index=True, width="stretch")
                 rate_map = dict(zip(edited_inf['Year'].astype(int), edited_inf['Inflation(%)'] / 100))
                 discount_factors = pd.Series(1.0, index=comp_df.index)
                 for i, date in enumerate(comp_df.index):
@@ -927,11 +734,11 @@ if st.session_state.run_backtest:
 
         # --- Metrics Calculation ---
         metrics = []
-        bench_m = calculate_metrics(comp_df[f"Benchmark({bench_in})"], 0)
+        bench_m = calculate_metrics(comp_df[f"Benchmark({bench_in})"], 0, risk_free_rate=rf_rate)
         bench_m["name"] = f"Benchmark({bench_in})"
         metrics.append(bench_m)
         for p_name, cnt in valid_ports_meta.items():
-            m = calculate_metrics(comp_df[p_name], cnt)
+            m = calculate_metrics(comp_df[p_name], cnt, risk_free_rate=rf_rate)
             m["name"] = p_name
             metrics.append(m)
 
@@ -990,7 +797,45 @@ if st.session_state.run_backtest:
         ).configure_view(
             strokeWidth=0
         )
-        st.altair_chart(base_chart, use_container_width=True)
+        st.altair_chart(base_chart, width="stretch")
+
+        # --- Drawdown Chart ---
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+        with st.expander("Drawdown", expanded=True):
+            dd_df = comp_df / comp_df.cummax() - 1
+            dd_long = dd_df.reset_index().melt('Date', var_name='Portfolio', value_name='Drawdown')
+            dd_wide = dd_df.reset_index()
+            dd_nearest = alt.selection_point(nearest=True, on='mouseover', fields=['Date'], empty=False)
+
+            dd_line = alt.Chart(dd_long).mark_line(strokeWidth=2).encode(
+                x=alt.X('Date:T', axis=alt.Axis(format=x_axis_format, title=None, labelAngle=label_angle, grid=False)),
+                y=alt.Y('Drawdown:Q', axis=alt.Axis(format='.0%', title='Drawdown', grid=True, gridDash=[3,3], gridColor='#e5e7eb')),
+                color=alt.Color('Portfolio:N', legend=alt.Legend(orient='top', title=None, labelFontSize=12), scale=alt.Scale(range=palette))
+            )
+            dd_tooltips = [alt.Tooltip('Date:T', format='%Y-%m-%d', title='Date')]
+            for col in dd_df.columns:
+                dd_tooltips.append(alt.Tooltip(field=col, type='quantitative', format='.2%', title=col))
+            dd_selectors = alt.Chart(dd_wide).mark_rule(opacity=0.001, strokeWidth=40).encode(
+                x='Date:T', tooltip=dd_tooltips
+            ).add_params(dd_nearest)
+            dd_rules = alt.Chart(dd_wide).mark_rule(color='#94a3b8', strokeDash=[3,3]).encode(
+                x='Date:T', tooltip=dd_tooltips
+            ).transform_filter(dd_nearest)
+            dd_points = dd_line.mark_point(size=60, filled=True).encode(
+                opacity=alt.condition(dd_nearest, alt.value(1), alt.value(0))
+            )
+            dd_chart = alt.layer(dd_line, dd_selectors, dd_rules, dd_points).properties(
+                height=260
+            ).configure_view(strokeWidth=0)
+            st.altair_chart(dd_chart, width="stretch")
+
+        # --- NAV CSV Export ---
+        st.download_button(
+            ":material/download: Export NAV Series (CSV)",
+            data=comp_df.to_csv(date_format="%Y-%m-%d").encode("utf-8-sig"),
+            file_name=f"backtest_nav_{actual_start_day.date()}.csv",
+            mime="text/csv",
+        )
 
         # --- Detail Tabs ---
         if res_list:
@@ -1006,7 +851,7 @@ if st.session_state.run_backtest:
             for tab, lbl in zip(tabs, tab_names):
                 with tab:
                     st.caption(f"Start: {actual_start_day.date()}")
-                    st.dataframe(res_list[lbl].style.apply(style_row, axis=1).format({"NAV": "{:,.2f}"}), use_container_width=True)
+                    st.dataframe(res_list[lbl].style.apply(style_row, axis=1).format({"NAV": "{:,.2f}"}), width="stretch")
 
         # --- Annual Returns by Calendar Year ---
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)

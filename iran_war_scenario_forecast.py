@@ -314,7 +314,7 @@ if ACTUAL_DATA is not None and not ACTUAL_DATA.empty:
     last_portfolio = ACTUAL_DATA["组合"].dropna().iloc[-1]
     col_status, col_refresh = st.columns([0.85, 0.15])
     with col_status:
-        st.caption(f"📡 实际数据最后交易日: **{last_date}** | 组合实际累计收益: **{last_portfolio:+.2f}%** | 数据缓存5分钟自动刷新")
+        st.caption(f"📡 实际数据最后交易日: **{last_date}** | 组合实际累计收益: **{last_portfolio:+.2f}%** | 数据缓存1小时，可点击刷新")
     with col_refresh:
         if st.button("🔄 刷新数据"):
             st.cache_data.clear()
@@ -563,7 +563,7 @@ with tab1:
                            range=[SCENARIO_COLORS[k] for k in SCENARIO_META])
         chart_p = build_chart(df_portfolio, "情景", scale_p, "AV-US 组合：五情景走势 (黑线=实际)",
                               height=420, actual_series=["组合"])
-        st.altair_chart(chart_p, use_container_width=True)
+        st.altair_chart(chart_p, width="stretch")
 
     with col_overview_2:
         st.markdown("#### 五情景终态对比")
@@ -578,7 +578,7 @@ with tab1:
                 **{a: f"{last[a]:+.1f}%" for a in ASSETS},
                 "组合": f"{last['组合']:+.1f}%",
             })
-        st.dataframe(pd.DataFrame(terminal_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(terminal_rows), width="stretch", hide_index=True)
 
         # Max drawdown comparison
         st.markdown("#### 组合最大回撤对比")
@@ -591,7 +591,7 @@ with tab1:
             "概率加权": {"最大回撤": "-5.7%", "时点": "—", "12个月回报": "+1.5%"},
         }
         dd_df = pd.DataFrame(dd_data).T.reset_index().rename(columns={"index": "情景"})
-        st.dataframe(dd_df, use_container_width=True, hide_index=True)
+        st.dataframe(dd_df, width="stretch", hide_index=True)
 
 # ---- TAB 2: 单情景查看 ----
 with tab2:
@@ -616,7 +616,7 @@ with tab2:
         f"{meta['name']} — 各资产全过程走势 (黑线=实际AV-US)",
         height=500, actual_series=["组合"],
     )
-    st.altair_chart(chart_single, use_container_width=True)
+    st.altair_chart(chart_single, width="stretch")
 
     # Data table for this scenario
     with st.expander("📋 查看详细数据表"):
@@ -627,7 +627,7 @@ with tab2:
             for a in ALL_SERIES:
                 row[a] = f"{p[a]:+.1f}%"
             display_rows.append(row)
-        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(display_rows), width="stretch", hide_index=True)
 
 # ---- TAB 3: 单资产跨情景 ----
 with tab3:
@@ -651,7 +651,7 @@ with tab3:
         f"{selected_asset} ({asset_weight_info}) — 五情景走势对比 (黑线=实际)",
         height=500, actual_series=[selected_asset],
     )
-    st.altair_chart(chart_asset, use_container_width=True)
+    st.altair_chart(chart_asset, width="stretch")
 
     # Summary table for this asset across scenarios
     with st.expander("📋 查看详细数据表"):
@@ -665,7 +665,7 @@ with tab3:
                     "日期": month_to_date(p["month"]),
                     f"{selected_asset} 收益率": f"{p[selected_asset]:+.1f}%",
                 })
-        st.dataframe(pd.DataFrame(asset_table_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(asset_table_rows), width="stretch", hide_index=True)
 
 # ---- Footer ----
 st.divider()
