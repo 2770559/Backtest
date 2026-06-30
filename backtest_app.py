@@ -18,8 +18,8 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "1.2.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-06-10"
+APP_VERSION = "1.3.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-06-30"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -293,7 +293,7 @@ def validate_inputs(portfolios, benchmark):
     if dup_names:
         errors.append("Duplicate portfolio names: " + ", ".join(dup_names))
     for p in portfolios:
-        _, _, perrs = parse_portfolio(p)
+        _, _, perrs, _ = parse_portfolio(p)
         errors.extend(f"**{p['name']}**: {e}" for e in perrs)
     return errors
 
@@ -520,7 +520,7 @@ strategy_options = [
 # Column headers
 hdr = st.columns([0.8, 3, 2, 2, 0.8, 0.4])
 with hdr[0]: st.caption("Name")
-with hdr[1]: st.caption("Tickers")
+with hdr[1]: st.caption("Tickers  ·  group with ( ) for composites")
 with hdr[2]: st.caption("Weights")
 with hdr[3]: st.caption("Strategy")
 with hdr[4]: st.caption("Thr%")
@@ -531,7 +531,10 @@ for i, port in enumerate(st.session_state.portfolios_list):
 
     cols = st.columns([0.8, 3, 2, 2, 0.8, 0.4])
     with cols[0]: st.markdown(f"**{port['name']}**")
-    with cols[1]: port['tickers'] = st.text_input("Tickers", port['tickers'], key=f"t_{port['id']}", label_visibility="collapsed")
+    with cols[1]: port['tickers'] = st.text_input(
+        "Tickers", port['tickers'], key=f"t_{port['id']}", label_visibility="collapsed",
+        help='Composite slot: wrap elements in parentheses, e.g. "QQQM, GLDM, (DBMF, KMLM)". '
+             "The slot takes ONE weight, split equally across its elements, and rebalances as one block.")
     with cols[2]: port['weights'] = st.text_input("Weights", port['weights'], key=f"w_{port['id']}", label_visibility="collapsed")
     with cols[3]: port['strat'] = st.selectbox("Strategy", strategy_options, index=strategy_options.index(port['strat']), key=f"s_{port['id']}", label_visibility="collapsed")
     with cols[4]: port['thr'] = st.number_input("Thr%", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed")
@@ -575,11 +578,11 @@ if st.session_state.run_backtest:
 
     parsed_ports = []
     for p in st.session_state.portfolios_list:
-        p_tks, p_wts, _ = parse_portfolio(p)
-        parsed_ports.append((p, p_tks, p_wts))
+        p_tks, p_wts, _, p_comp = parse_portfolio(p)
+        parsed_ports.append((p, p_tks, p_wts, p_comp))
 
     with st.spinner('Fetching data & running backtest...'):
-        all_tks = sorted(set([clean_ticker(bench_in)] + [t for _, p_tks, _ in parsed_ports for t in p_tks]))
+        all_tks = sorted(set([clean_ticker(bench_in)] + [t for _, p_tks, _, _ in parsed_ports for t in p_tks]))
         try:
             df_raw = fetch_price_history(tuple(all_tks), str(start_d - timedelta(days=20)))
         except Exception as e:
@@ -616,7 +619,7 @@ if st.session_state.run_backtest:
         df_aligned = df_aligned[df_aligned.index >= market_start_day]
         df_filled = df_aligned.ffill().bfill()
 
-        all_port_tks = sorted({t for _, p_tks, _ in parsed_ports for t in p_tks})
+        all_port_tks = sorted({t for _, p_tks, _, _ in parsed_ports for t in p_tks})
         raw_aligned = df_aligned[all_port_tks]
         first_valid_idx = raw_aligned.apply(lambda x: x.first_valid_index())
         bottleneck_date = first_valid_idx.max()
@@ -656,38 +659,101 @@ if st.session_state.run_backtest:
         valid_ports_meta = {}
 
         def clean_col(c):
-            target = c.strip()
+            target = str(c).strip()
             for tk, name in TICKER_TO_NAME.items():
                 if tk in target: return name
             return target
 
-        for p, p_tks, p_wts in parsed_ports:
-            valid_p_tks = [t for t in p_tks if t in price_df.columns and not price_df[t].isna().all()]
-            dropped_tks = [t for t in p_tks if t not in valid_p_tks]
+        def _pct_to_float(s):
+            try: return float(str(s).rstrip('%')) / 100.0
+            except (ValueError, TypeError): return np.nan
+
+        for p, p_tks, p_wts, p_comp in parsed_ports:
+            has_data = lambda t: t in price_df.columns and not price_df[t].isna().all()
+
+            # Slot view: composite metadata if present, else one singleton per element.
+            if p_comp:
+                slots = list(zip(p_comp["slot_labels"], p_comp["slot_members"], p_comp["slot_targets"]))
+            else:
+                slots = [(t, [t], w) for t, w in zip(p_tks, p_wts)]
+
+            # Drop dataless elements: re-split a slot among survivors; drop a slot
+            # only if ALL its elements are dataless.
+            valid_p_tks, elem_weights, slot_survivors = [], {}, {}
+            dropped_elems, dropped_slots = [], []
+            for si, (lbl, members, st_w) in enumerate(slots):
+                live = [t for t in members if has_data(t)]
+                dead = [t for t in members if not has_data(t)]
+                if not live:
+                    dropped_slots.append(lbl); continue
+                if dead: dropped_elems.extend(dead)
+                per = st_w / len(live)                 # equal split across survivors
+                for t in live:
+                    elem_weights[t] = per; valid_p_tks.append(t)
+                slot_survivors[si] = live
             if not valid_p_tks:
                 st.error(f"**{p['name']}**: no usable data for any ticker ({', '.join(p_tks)}) \u2014 portfolio skipped.")
                 continue
-            w_series = pd.Series(p_wts, index=p_tks)
-            if dropped_tks:
-                w_series = w_series[valid_p_tks]
-                w_series = w_series / w_series.sum()
-                st.warning(
-                    f"**{p['name']}**: no data for **{', '.join(dropped_tks)}** \u2014 dropped from portfolio; "
-                    "remaining weights renormalized: "
-                    + ", ".join(f"{t} {w:.1%}" for t, w in w_series.items())
-                )
 
-            res_df, cnt, pnl_rec = run_detailed_backtest(p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0)
+            w_series = pd.Series(elem_weights).reindex(valid_p_tks)
+            # Renormalize ONLY when something was dropped (no-drop path stays
+            # byte-identical to the legacy un-normalized weights). One-shot
+            # normalization handles intra-slot re-split + cross-slot drop together.
+            if dropped_elems or dropped_slots:
+                w_series = w_series / w_series.sum()
+            if dropped_elems:
+                st.warning(
+                    f"**{p['name']}**: no data for **{', '.join(dropped_elems)}** \u2014 "
+                    "dropped from their composite; slot re-split among remaining elements.")
+            if dropped_slots:
+                st.warning(
+                    f"**{p['name']}**: no data for **{', '.join(dropped_slots)}** \u2014 "
+                    "dropped; remaining weights renormalized: "
+                    + ", ".join(f"{t} {w:.1%}" for t, w in w_series.items()))
+
+            # Engine groups: element -> synthetic slot-id, only for composite slots
+            # that still have >1 surviving element. Empty => None => legacy path.
+            groups = {}
+            for si, live in slot_survivors.items():
+                if len(live) > 1:
+                    for t in live: groups[t] = f"__slot{si}"
+            groups = groups or None
+
+            res_df, cnt, pnl_rec = run_detailed_backtest(
+                p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0, groups=groups)
             if not res_df.empty:
+                # For each surviving composite slot, add an aggregate weight column
+                # and a per-element display prefix. clean_col_p translates each member
+                # separately so CN-listed tickers don't collapse under substring match.
+                comp_slots = {si: live for si, live in slot_survivors.items() if len(live) > 1}
+                member_disp = {}
+                for si, live in comp_slots.items():
+                    disp = "+".join(clean_col(m) for m in live)
+                    for t in live: member_disp[t] = disp
+                    agg_name = "+".join(live) + " (slot)"
+                    res_df[agg_name] = res_df[live].apply(
+                        lambda row: sum(_pct_to_float(x) for x in row), axis=1
+                    ).map(lambda v: f"{v:.2%}" if pd.notna(v) else "-")
+                    pnl_rec[agg_name] = f"{sum(_pct_to_float(pnl_rec[m]) for m in live):.2%}"
+
+                def clean_col_p(c, _md=member_disp):
+                    raw = str(c).strip()
+                    if raw.endswith(" (slot)"):
+                        body = raw[:-len(" (slot)")]
+                        return "+".join(clean_col(m) for m in body.split("+")) + " (slot)"
+                    if raw in _md:
+                        return f"{_md[raw]}\u00b7{clean_col(raw)}"
+                    return clean_col(raw)
+
                 df_chart = res_df.drop_duplicates(subset='Date', keep='last').copy()
                 df_chart['Date'] = pd.to_datetime(df_chart['Date'])
                 df_chart = df_chart.set_index('Date')
                 comp_df[p['name']] = df_chart['NAV']
                 valid_ports_meta[p['name']] = cnt
                 translated_pnl = {}
-                for k, v in pnl_rec.items(): translated_pnl[clean_col(k)] = v
+                for k, v in pnl_rec.items(): translated_pnl[clean_col_p(k)] = v
                 pnl_df = pd.DataFrame([translated_pnl])
-                df_history = res_df.iloc[::-1].rename(columns=clean_col).reset_index(drop=True)
+                df_history = res_df.iloc[::-1].rename(columns=clean_col_p).reset_index(drop=True)
                 df_history['Date'] = pd.to_datetime(df_history['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
                 res_list[p['name']] = pd.concat([pnl_df, df_history], ignore_index=True)
 

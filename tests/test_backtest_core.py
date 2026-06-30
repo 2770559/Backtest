@@ -27,35 +27,35 @@ class TestCleanTicker(unittest.TestCase):
 
 class TestParsePortfolio(unittest.TestCase):
     def test_valid(self):
-        tks, wts, errs = parse_portfolio({"tickers": "QQQM, SPY", "weights": "0.6, 0.4"})
+        tks, wts, errs, _ = parse_portfolio({"tickers": "QQQM, SPY", "weights": "0.6, 0.4"})
         self.assertEqual(tks, ["QQQM", "SPY"])
         self.assertEqual(wts, [0.6, 0.4])
         self.assertEqual(errs, [])
 
     def test_fullwidth_comma(self):
-        tks, wts, errs = parse_portfolio({"tickers": "QQQM，SPY", "weights": "0.5，0.5"})
+        tks, wts, errs, _ = parse_portfolio({"tickers": "QQQM，SPY", "weights": "0.5，0.5"})
         self.assertEqual(tks, ["QQQM", "SPY"])
         self.assertEqual(errs, [])
 
     def test_trailing_comma_ignored(self):
-        tks, wts, errs = parse_portfolio({"tickers": "QQQM, SPY,", "weights": "0.5, 0.5"})
+        tks, wts, errs, _ = parse_portfolio({"tickers": "QQQM, SPY,", "weights": "0.5, 0.5"})
         self.assertEqual(tks, ["QQQM", "SPY"])
         self.assertEqual(errs, [])
 
     def test_count_mismatch(self):
-        _, _, errs = parse_portfolio({"tickers": "QQQM, SPY, GLD", "weights": "0.5, 0.5"})
+        _, _, errs, _ = parse_portfolio({"tickers": "QQQM, SPY, GLD", "weights": "0.5, 0.5"})
         self.assertTrue(any("3 tickers vs 2 weights" in e for e in errs))
 
     def test_invalid_float(self):
-        _, _, errs = parse_portfolio({"tickers": "QQQM, SPY", "weights": "0.5, abc"})
+        _, _, errs, _ = parse_portfolio({"tickers": "QQQM, SPY", "weights": "0.5, abc"})
         self.assertTrue(any("invalid weight format" in e for e in errs))
 
     def test_weight_sum(self):
-        _, _, errs = parse_portfolio({"tickers": "QQQM, SPY", "weights": "0.5, 0.6"})
+        _, _, errs, _ = parse_portfolio({"tickers": "QQQM, SPY", "weights": "0.5, 0.6"})
         self.assertTrue(any("should be 1.0" in e for e in errs))
 
     def test_duplicate_tickers(self):
-        _, _, errs = parse_portfolio({"tickers": "SPY, spy", "weights": "0.5, 0.5"})
+        _, _, errs, _ = parse_portfolio({"tickers": "SPY, spy", "weights": "0.5, 0.5"})
         self.assertTrue(any("duplicate tickers" in e for e in errs))
 
 

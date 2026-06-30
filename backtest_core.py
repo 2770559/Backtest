@@ -33,38 +33,122 @@ def clean_ticker(t):
     return mapping.get(t, t)
 
 
-def parse_portfolio(port):
-    """Parse one portfolio config dict into (tickers, weights, errors).
+def _split_top_level(s, sep=','):
+    """Split `s` on `sep`, ignoring separators inside parentheses.
 
-    Tickers are cleaned/normalized; weights are floats. errors is a list of
-    human-readable strings — empty list means the portfolio is valid.
-    Both fields accept fullwidth commas.
+    Returns (tokens, err); err is None on success else a human-readable string.
+    Nested parens are rejected. Used for the tickers field so a composite group
+    "(DBMF, KMLM)" stays one token.
+    """
+    tokens, buf, depth = [], [], 0
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            if depth > 1:
+                return None, "nested parentheses are not allowed"
+            buf.append(ch)
+        elif ch == ')':
+            depth -= 1
+            if depth < 0:
+                return None, "unbalanced ')' in tickers"
+            buf.append(ch)
+        elif ch == sep and depth == 0:
+            tokens.append(''.join(buf)); buf = []
+        else:
+            buf.append(ch)
+    if depth != 0:
+        return None, "unbalanced '(' in tickers"
+    tokens.append(''.join(buf))
+    return tokens, None
+
+
+def parse_portfolio(port):
+    """Parse one portfolio config dict into (tickers, weights, errors, composite).
+
+    tickers   : list[str]    FLAT element tickers (price-fetch order; cleaned)
+    weights   : list[float]  per-ELEMENT target weight (equal split inside a slot)
+    errors    : list[str]    human-readable; [] means valid
+    composite : dict | None  slot metadata; None when no (...) group is present
+
+    A weight token maps to one SLOT. A parenthesised group "(A, B)" is one slot
+    whose target weight is split equally across its elements ("默认平均分配份额").
+    Backward-compatible: a portfolio with no parentheses yields exactly today's
+    tickers/weights/errors and composite=None. Both fields accept fullwidth commas.
     """
     errors = []
-    t_str = str(port.get('tickers', '')).replace("，", ",")
+    t_str = str(port.get('tickers', '')).replace("，", ",").replace("（", "(").replace("）", ")")
     w_str = str(port.get('weights', '')).replace("，", ",")
-    t_list = [clean_ticker(x) for x in t_str.split(',') if x.strip()]
+
+    t_tokens, paren_err = _split_top_level(t_str, ',')
+    if paren_err:
+        return [], [], [paren_err], None
+
+    # Build slots: each token is a single ticker or a parenthesised composite group.
+    slot_labels, slot_members = [], []
+    has_composite = False
+    for tok in t_tokens:
+        tok = tok.strip()
+        if not tok:
+            continue  # trailing/empty token ignored (matches today's behaviour)
+        if tok.startswith('(') and tok.endswith(')'):
+            has_composite = True
+            members = [clean_ticker(x) for x in tok[1:-1].split(',') if x.strip()]
+            if len(members) == 0:
+                errors.append(f"empty composite '{tok}'")
+                continue
+            if len(members) == 1:
+                errors.append(f"composite '{tok}' needs >= 2 elements")
+            slot_labels.append("+".join(members))
+            slot_members.append(members)
+        else:
+            ck = clean_ticker(tok)
+            slot_labels.append(ck)
+            slot_members.append([ck])
+
     w_raw = [x.strip() for x in w_str.split(',') if x.strip()]
+    flat_now = [t for grp in slot_members for t in grp]
 
-    if len(t_list) != len(w_raw):
-        errors.append(f"{len(t_list)} tickers vs {len(w_raw)} weights")
-        return t_list, [], errors
-
-    dupes = sorted({t for t in t_list if t_list.count(t) > 1})
-    if dupes:
-        errors.append("duplicate tickers: " + ", ".join(dupes))
+    # Count check is SLOT-level (one weight per slot, not per element).
+    if len(slot_labels) != len(w_raw):
+        unit = "slots" if has_composite else "tickers"   # preserve legacy wording
+        errors.append(f"{len(slot_labels)} {unit} vs {len(w_raw)} weights")
+        return flat_now, [], errors, None
 
     try:
-        w_list = [float(w) for w in w_raw]
+        slot_targets = [float(w) for w in w_raw]
     except ValueError:
         errors.append("invalid weight format")
-        return t_list, [], errors
+        return flat_now, [], errors, None
 
-    total_w = sum(w_list)
+    total_w = sum(slot_targets)
     if abs(total_w - 1.0) > 0.01:
         errors.append(f"weights sum = {total_w:.2f}, should be 1.0")
 
-    return t_list, w_list, errors
+    # Duplicate detection across ALL elements (flat, cross-slot).
+    dupes = sorted({t for t in flat_now if flat_now.count(t) > 1})
+    if dupes:
+        errors.append("duplicate tickers: " + ", ".join(dupes))
+
+    # Expand slots -> per-element flat list + equal-split per-element weights.
+    elem_tickers, elem_weights, element_slot = [], [], []
+    for si, (members, st_w) in enumerate(zip(slot_members, slot_targets)):
+        per = st_w / len(members)
+        for m in members:
+            elem_tickers.append(m)
+            elem_weights.append(per)
+            element_slot.append(si)
+
+    composite = None
+    if has_composite:
+        composite = {
+            "has_composite": True,
+            "slot_labels": slot_labels,
+            "slot_targets": slot_targets,
+            "slot_members": slot_members,
+            "element_slot": element_slot,
+        }
+
+    return elem_tickers, elem_weights, errors, composite
 
 
 def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
@@ -109,7 +193,18 @@ def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
                 "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
 
 
-def apply_local_rebalance(asset_values, target_weights, threshold):
+def apply_local_rebalance(asset_values, target_weights, threshold, return_resets=False):
+    """Local relative-diff rebalance.
+
+    Triggered indices are reset to their target weight; the remainder is
+    redistributed proportionally to preserve its internal drift.
+
+    When return_resets=True, also returns the set of indices that were RESET to
+    target (vs only proportionally scaled) — the composite engine uses it to
+    decide which slots restore their default equal split. The math is byte-for-byte
+    the original; the only addition is threading `reset_indices` out. Default
+    False keeps the original single-value return so existing callers are unaffected.
+    """
     total_val = asset_values.sum()
     current_vals = asset_values.copy()
     reset_indices = []
@@ -123,16 +218,31 @@ def apply_local_rebalance(asset_values, target_weights, threshold):
         reset_indices.extend(triggered_indices)
         for idx in triggered_indices: current_vals[idx] = target_weights[idx] * total_val
         rem_indices = [i for i in current_vals.index if i not in reset_indices]
-        if not rem_indices: return total_val * target_weights
+        if not rem_indices:
+            out = total_val * target_weights
+            return (out, set(current_vals.index)) if return_resets else out
         rem_cash = total_val - current_vals[reset_indices].sum()
         current_rem_sum = asset_values[rem_indices].sum()
         if current_rem_sum > 0: ratios = asset_values[rem_indices] / current_rem_sum
         else: ratios = target_weights[rem_indices] / target_weights[rem_indices].sum()
         current_vals[rem_indices] = ratios * rem_cash
-    return current_vals
+    return (current_vals, set(reset_indices)) if return_resets else current_vals
 
 
-def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, threshold):
+def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
+                          threshold, groups=None):
+    """Backtest one portfolio under one rebalance strategy.
+
+    groups: optional element-ticker -> slot-id mapping (dict[str, str]). Elements
+    sharing a slot-id form a COMPOSITE: rebalance decisions are made on the slot's
+    AGGREGATE weight (elements never trigger individually), but each element keeps
+    its own price series so NAV = sum over elements. On a reset the slot value is
+    restored to an EQUAL split among its elements ("再平衡时恢复默认份额"); between
+    resets the elements drift and the slot moves "as one block".
+
+    groups=None  ==  every column is its own slot  ==  original behaviour,
+    bit-identical (singletons short-circuit the unfold; see below).
+    """
     tickers = price_df.columns
     if price_df.empty: return pd.DataFrame(), 0, {}
     start_prices = price_df.iloc[0]
@@ -140,13 +250,32 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
         start_prices = price_df.bfill().iloc[0]
         if start_prices.isna().any(): return pd.DataFrame(), 0, {}
 
-    current_shares = (initial_cap * target_weights) / start_prices
+    # Force alignment so groupby/elementwise ops are well-defined (no-op for valid
+    # callers, where target_weights is already indexed by price_df.columns).
+    target_weights = target_weights.reindex(tickers)
+
+    # ---- Slot grouping (identity when groups is None => default path) ----
+    gmap = groups or {}
+    slot_of = pd.Series({t: gmap.get(t, t) for t in tickers}, index=tickers)
+    # Stable slot order = first appearance across columns. For the identity map
+    # this is exactly price_df.columns, which guarantees bit-identity.
+    slot_ids = list(dict.fromkeys(slot_of.tolist()))
+    slot_members = {s: [t for t in tickers if slot_of[t] == s] for s in slot_ids}
+
+    # Slot-level targets = SUM of member element targets (singleton -> itself).
+    slot_targets = target_weights.groupby(slot_of).sum().reindex(slot_ids)
+
+    # Per-element initial weights = slot target split EQUALLY among its members.
+    member_counts = slot_of.map(slot_of.value_counts())            # aligned to columns
+    elem_init_weights = target_weights.groupby(slot_of).transform('sum') / member_counts
+    current_shares = (initial_cap * elem_init_weights) / start_prices
+
     history = []
     last_rebalance_date = price_df.index[0]
     rebalance_count = 0
     price_df_filled = price_df.ffill()
 
-    cumulative_pnl = pd.Series(0.0, index=tickers)
+    cumulative_pnl = pd.Series(0.0, index=tickers)                 # PnL stays element-level
     prev_prices = start_prices
 
     for i in range(len(price_df)):
@@ -156,53 +285,59 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
         if i > 0: cumulative_pnl += current_shares * (current_prices - prev_prices)
         prev_prices = current_prices
 
-        asset_values = current_shares * current_prices
+        asset_values = current_shares * current_prices            # element-level $
         total_val = asset_values.sum()
         if total_val == 0 or np.isnan(total_val): continue
-        current_weights = asset_values / total_val
+        current_weights = asset_values / total_val                # element-level weights
 
         if i == 0:
             rec = {"Date": current_date, "Type": "Init", "NAV": total_val}
             rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(rec); continue
 
-        do_rebalance = False
-        new_values = asset_values.copy()
+        # ---- FOLD: aggregate elements up to slots for the decision ----
+        slot_values = asset_values.groupby(slot_of).sum().reindex(slot_ids)
+        slot_weights = slot_values / total_val
 
+        do_rebalance = False
+        new_slot_values = slot_values.copy()
+        reset_slots = set()                                       # slots restored to default split
+
+        # ---- DECISION: EXISTING trigger math, now on slot Series ----
         if strategy_name == STRAT_ANNUAL:
             if (current_date - last_rebalance_date).days >= 365:
-                new_values, do_rebalance = total_val * target_weights, True
+                new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
         elif strategy_name == STRAT_SEMI:
             if (current_date - last_rebalance_date).days >= 180:
-                new_values, do_rebalance = total_val * target_weights, True
+                new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
 
         elif strategy_name == STRAT_ASYM:
-            diff_ratio = (current_weights - target_weights) / target_weights.replace(0, 1e-9)
-            mask_major = target_weights >= 0.06
-            mask_minor = target_weights < 0.06
+            diff_ratio = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
+            mask_major = slot_targets >= 0.06
+            mask_minor = slot_targets < 0.06
 
             trigger_major = mask_major & (np.abs(diff_ratio) > threshold)
             trigger_minor_up = mask_minor & (diff_ratio > threshold * 2.5)
             trigger_minor_down = mask_minor & (diff_ratio < -threshold * 1.25)
 
             if trigger_major.any() or trigger_minor_up.any() or trigger_minor_down.any():
-                new_values = total_val * target_weights
-                do_rebalance = True
+                new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
 
         elif "RelDiff" in strategy_name:
-            rel_diffs = np.abs(current_weights - target_weights) / target_weights.replace(0, 1e-9)
+            rel_diffs = np.abs(slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
             if rel_diffs.max() > threshold:
                 if strategy_name == STRAT_RD_FULL:
-                    new_values = total_val * target_weights
-                    do_rebalance = True
+                    new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
                 elif strategy_name == STRAT_RD_MIXED:
-                    if ((target_weights >= 0.1) & (rel_diffs > threshold)).any():
-                        new_values = total_val * target_weights
+                    if ((slot_targets >= 0.1) & (rel_diffs > threshold)).any():
+                        new_slot_values, reset_slots = total_val * slot_targets, set(slot_ids)
                     else:
-                        new_values = apply_local_rebalance(asset_values, target_weights, threshold)
+                        new_slot_values, reset_slots = apply_local_rebalance(
+                            slot_values, slot_targets, threshold, return_resets=True)
                     do_rebalance = True
                 elif strategy_name == STRAT_RD_LOCAL:
-                    new_values = apply_local_rebalance(asset_values, target_weights, threshold)
+                    new_slot_values, reset_slots = apply_local_rebalance(
+                        slot_values, slot_targets, threshold, return_resets=True)
                     do_rebalance = True
 
         if do_rebalance:
@@ -210,9 +345,33 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap, 
             pre_rec = {"Date": current_date, "Type": "Pre-Rebal", "NAV": total_val}
             pre_rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(pre_rec)
+
+            # ---- UNFOLD: expand slot values back to element values ----
+            # Singletons assign directly (no float round-trip) => legacy path is
+            # byte-identical. Composites: reset -> equal default split; otherwise
+            # scale each element as one block, preserving internal drift.
+            new_values = asset_values.copy()
+            for s in slot_ids:
+                members = slot_members[s]
+                nsv = new_slot_values[s]
+                if len(members) == 1:
+                    new_values[members[0]] = nsv
+                elif s in reset_slots:
+                    share = nsv / len(members)
+                    for m in members: new_values[m] = share
+                else:
+                    osv = slot_values[s]
+                    if osv > 0:
+                        scale = nsv / osv
+                        for m in members: new_values[m] = asset_values[m] * scale
+                    else:
+                        share = nsv / len(members)
+                        for m in members: new_values[m] = share
+
             current_shares, last_rebalance_date = new_values / current_prices, current_date
+            post_weights = new_values / total_val
             post_rec = {"Date": current_date, "Type": "Post-Rebal", "NAV": total_val}
-            post_rec.update({f"{t}": f"{(new_values/total_val)[t]:.2%}" for t in tickers})
+            post_rec.update({f"{t}": f"{post_weights[t]:.2%}" for t in tickers})
             history.append(post_rec)
         else:
             rec = {"Date": current_date, "Type": "Hold", "NAV": total_val}
