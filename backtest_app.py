@@ -18,7 +18,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "1.3.0"  # semver: major.minor.patch
+APP_VERSION = "1.3.1"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-06-30"
 
 # --- 1. Page Config ---
@@ -722,27 +722,23 @@ if st.session_state.run_backtest:
             res_df, cnt, pnl_rec = run_detailed_backtest(
                 p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0, groups=groups)
             if not res_df.empty:
-                # For each surviving composite slot, add an aggregate weight column
-                # and a per-element display prefix. clean_col_p translates each member
-                # separately so CN-listed tickers don't collapse under substring match.
+                # For each surviving composite slot, add an aggregate weight column.
+                # Element columns keep their OWN ticker name (no slot prefix \u2014 keeps
+                # headers narrow). The slot's members are translated separately only in
+                # the "(slot)" header so CN tickers don't collapse under substring match.
                 comp_slots = {si: live for si, live in slot_survivors.items() if len(live) > 1}
-                member_disp = {}
                 for si, live in comp_slots.items():
-                    disp = "+".join(clean_col(m) for m in live)
-                    for t in live: member_disp[t] = disp
                     agg_name = "+".join(live) + " (slot)"
                     res_df[agg_name] = res_df[live].apply(
                         lambda row: sum(_pct_to_float(x) for x in row), axis=1
                     ).map(lambda v: f"{v:.2%}" if pd.notna(v) else "-")
                     pnl_rec[agg_name] = f"{sum(_pct_to_float(pnl_rec[m]) for m in live):.2%}"
 
-                def clean_col_p(c, _md=member_disp):
+                def clean_col_p(c):
                     raw = str(c).strip()
                     if raw.endswith(" (slot)"):
                         body = raw[:-len(" (slot)")]
                         return "+".join(clean_col(m) for m in body.split("+")) + " (slot)"
-                    if raw in _md:
-                        return f"{_md[raw]}\u00b7{clean_col(raw)}"
                     return clean_col(raw)
 
                 df_chart = res_df.drop_duplicates(subset='Date', keep='last').copy()
