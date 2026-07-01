@@ -18,7 +18,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "1.3.2"  # semver: major.minor.patch
+APP_VERSION = "1.3.3"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-06-30"
 
 # --- 1. Page Config ---
@@ -264,8 +264,18 @@ if 'portfolios_list' not in st.session_state:
             "thr": 38
         },
         {
+            # Port A with the ETH-USD sleeve split into a composite (ETH-USD, MSTR),
+            # same 5% slot -> 2.5% / 2.5%. Everything else identical to Port A.
             "id": str(uuid.uuid4()),
             "name": "Port B",
+            "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
+            "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
+            "strat": STRAT_ASYM,
+            "thr": 38
+        },
+        {
+            "id": str(uuid.uuid4()),
+            "name": "Port C",
             "tickers": "159941.SZ, 512890.SS, 515220.SS, 588080.SS, 518880.SS, 511130.SS",
             "weights": "0.35, 0.15, 0.10, 0.05, 0.15, 0.20",
             "strat": STRAT_RD_MIXED,
