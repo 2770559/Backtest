@@ -24,6 +24,16 @@ class TestCleanTicker(unittest.TestCase):
         self.assertEqual(clean_ticker("qqqm"), "QQQM")
         self.assertEqual(clean_ticker("159941.sz"), "159941.SZ")
 
+    def test_hk_code_normalization(self):
+        # 5-digit / leading-zero HK codes -> Yahoo's canonical 4-digit form
+        self.assertEqual(clean_ticker("00700.HK"), "0700.HK")
+        self.assertEqual(clean_ticker("09992.hk"), "9992.HK")
+        self.assertEqual(clean_ticker("700.HK"), "0700.HK")
+        self.assertEqual(clean_ticker("0700.HK"), "0700.HK")   # already canonical
+        self.assertEqual(clean_ticker("9988.HK"), "9988.HK")
+        self.assertEqual(clean_ticker("80737.HK"), "80737.HK")  # genuine 5-digit untouched
+        self.assertEqual(clean_ticker("600519.SS"), "600519.SS")  # non-HK unaffected
+
 
 class TestParsePortfolio(unittest.TestCase):
     def test_valid(self):

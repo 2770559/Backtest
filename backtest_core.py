@@ -30,7 +30,18 @@ STRAT_LEGACY_MAP = {
 def clean_ticker(t):
     t = t.strip().upper()
     mapping = {"BRK.B": "BRK-B", "ETHUSD": "ETH-USD", "BTCUSD": "BTC-USD"}
-    return mapping.get(t, t)
+    if t in mapping:
+        return mapping[t]
+    # Normalize Hong Kong codes to Yahoo's canonical 4-digit form:
+    # 00700.HK -> 0700.HK, 09992.HK -> 9992.HK. Yahoo 404s on the 5-digit,
+    # leading-zero-padded codes many brokers/data feeds use. int() strips
+    # leading zeros; :04d re-pads to a minimum of 4 digits, so genuine
+    # 5-digit codes (e.g. 80737.HK) are left untouched.
+    if t.endswith(".HK"):
+        code = t[:-3]
+        if code.isdigit():
+            return f"{int(code):04d}.HK"
+    return t
 
 
 def _split_top_level(s, sep=','):
