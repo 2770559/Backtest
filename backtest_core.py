@@ -14,6 +14,17 @@ STRAT_RD_LOCAL = "RelDiff Local"           # Relative-diff local rebalance
 STRAT_RD_MIXED = "RelDiff Mixed"           # Relative-diff mixed rebalance
 STRAT_RD_FULL  = "RelDiff Full"            # Relative-diff global rebalance
 STRAT_ASYM     = "Asymmetric RelDiff"      # Asymmetric relative-diff rebalance
+STRAT_ASYM_LOCAL = "Asymmetric RelDiff Local"  # Asymmetric trigger; minor breach handled locally
+STRAT_ASYM_LOCAL_EQ = "Asymmetric RelDiff Local (Equal)"    # minor breach: trade vs majors, equal dollar split
+STRAT_ASYM_LOCAL_PROP = "Asymmetric RelDiff Local (Prop)"   # minor breach: trade vs majors, pro-rata to current value
+
+# Distribution mode for the "Asymmetric RelDiff Local" family: how a triggered
+# minor slot's correction is split across the major (>= 6%) counterparties.
+ASYM_LOCAL_MODES = {
+    STRAT_ASYM_LOCAL: "rank",           # most-deviated major first, capped at its target
+    STRAT_ASYM_LOCAL_EQ: "equal",       # equal dollar split across ALL majors, no target cap
+    STRAT_ASYM_LOCAL_PROP: "prop",      # split across ALL majors pro-rata to current value, no cap
+}
 
 # Legacy (Chinese) strategy names from configs exported by v1.0.x
 STRAT_LEGACY_MAP = {
@@ -240,6 +251,84 @@ def apply_local_rebalance(asset_values, target_weights, threshold, return_resets
     return (current_vals, set(reset_indices)) if return_resets else current_vals
 
 
+def _transfer_minor_vs_majors(work, target_vals, majors, s, need, mode):
+    """Trade a triggered MINOR slot back toward its target against the MAJOR slots.
+
+    Mutates `work` (slot-id -> $ value Series) in place, moving up to abs(need)
+    dollars between minor slot `s` and the majors; every transfer conserves NAV
+    and minors never trade with other minors. Returns dollars actually moved.
+
+    mode="rank"  : counterparties ranked most-deviated first, each move capped so
+                   the major never crosses its OWN target; if the eligible majors
+                   can't fund/absorb it all, the minor is only PARTIALLY corrected.
+    mode="equal" : split across ALL majors in equal dollar shares, no target cap
+                   (majors may cross their own target). On the pull side a major
+                   can't go below zero; any shortfall cascades to the others.
+    mode="prop"  : split across ALL majors pro-rata to their CURRENT values, no
+                   target cap. Pro-rata pulls can never turn a major negative.
+    """
+    moved = 0.0
+    if need > 0:                                      # minor under target: pull from majors
+        if mode == "rank":                            # over-weight majors only, most-deviated first
+            pool = [j for j in majors if work[j] > target_vals[j]]
+            pool.sort(key=lambda j: (work[j] - target_vals[j]) / target_vals[j], reverse=True)
+            for j in pool:
+                if need <= 1e-9: break
+                take = min(need, work[j] - target_vals[j])   # cap: don't cross target
+                work[j] -= take; work[s] += take
+                need -= take; moved += take
+        elif mode == "equal":
+            pool = [j for j in majors if work[j] > 0]
+            while need > 1e-9 and pool:
+                share = need / len(pool)
+                survivors = []
+                for j in pool:
+                    take = min(share, work[j])        # a major can't fund past zero
+                    work[j] -= take; work[s] += take
+                    need -= take; moved += take
+                    if work[j] > 1e-9: survivors.append(j)
+                pool = survivors
+        else:                                         # prop
+            tot = sum(work[j] for j in majors if work[j] > 0)
+            if tot > 0:
+                amt = min(need, tot)
+                for j in majors:
+                    if work[j] <= 0: continue
+                    take = amt * (work[j] / tot)
+                    work[j] -= take; work[s] += take
+                    moved += take
+    elif need < 0:                                    # minor over target: push excess to majors
+        excess = -need
+        if mode == "rank":                            # under-weight majors only, most-deviated first
+            pool = [j for j in majors if work[j] < target_vals[j]]
+            pool.sort(key=lambda j: (work[j] - target_vals[j]) / target_vals[j])
+            for j in pool:
+                if excess <= 1e-9: break
+                give = min(excess, target_vals[j] - work[j])  # cap: don't cross target
+                work[j] += give; work[s] -= give
+                excess -= give; moved += give
+        elif mode == "equal":
+            if majors:
+                share = excess / len(majors)
+                for j in majors:
+                    work[j] += share; work[s] -= share
+                    moved += share
+        else:                                         # prop
+            tot = sum(work[j] for j in majors if work[j] > 0)
+            if tot > 0:
+                for j in majors:
+                    if work[j] <= 0: continue
+                    give = excess * (work[j] / tot)
+                    work[j] += give; work[s] -= give
+                    moved += give
+            elif majors:                              # degenerate: all majors at $0 -> equal split
+                share = excess / len(majors)
+                for j in majors:
+                    work[j] += share; work[s] -= share
+                    moved += share
+    return moved
+
+
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                           threshold, groups=None):
     """Backtest one portfolio under one rebalance strategy.
@@ -293,7 +382,9 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         current_date = price_df.index[i]
         current_prices = price_df_filled.iloc[i]
 
-        if i > 0: cumulative_pnl += current_shares * (current_prices - prev_prices)
+        # fillna: with leading-NaN price series (asset not yet listed) the NaN
+        # diff would otherwise poison that asset's cumulative PnL permanently.
+        if i > 0: cumulative_pnl += (current_shares * (current_prices - prev_prices)).fillna(0.0)
         prev_prices = current_prices
 
         asset_values = current_shares * current_prices            # element-level $
@@ -333,6 +424,49 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
             if trigger_major.any() or trigger_minor_up.any() or trigger_minor_down.any():
                 new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
+
+        elif strategy_name in ASYM_LOCAL_MODES:
+            # Same asymmetric trigger geometry as STRAT_ASYM, but a MINOR-only
+            # breach is corrected LOCALLY instead of forcing a global reset. A
+            # major breach still resets globally (bit-identical to STRAT_ASYM).
+            #
+            # For a minor-only breach, each TRIGGERED minor slot is nudged back
+            # toward its target by trading ONLY against the MAJOR (>= 6%) slots;
+            # other minor slots are left untouched unless they triggered too.
+            # HOW the correction is split across the majors is the only difference
+            # between the three variants — see _transfer_minor_vs_majors:
+            #   rank (STRAT_ASYM_LOCAL):        most-deviated major first, each move
+            #        capped at that major's own target ("恢复到基础比例优先");
+            #        insufficient majors => the minor is only PARTIALLY corrected.
+            #   equal (STRAT_ASYM_LOCAL_EQ):    equal dollar split across all majors.
+            #   prop (STRAT_ASYM_LOCAL_PROP):   pro-rata to majors' current values.
+            # Transfers read/mutate the live `work` state so multiple minors in one
+            # bar compound correctly. Triggered minor slots restore their composite
+            # default split (reset); major counterparties scale, keeping drift.
+            diff_ratio = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
+            mask_major = slot_targets >= 0.06
+            mask_minor = slot_targets < 0.06
+
+            trigger_major = mask_major & (np.abs(diff_ratio) > threshold)
+            trigger_minor_up = mask_minor & (diff_ratio > threshold * 2.5)
+            trigger_minor_down = mask_minor & (diff_ratio < -threshold * 1.25)
+
+            if trigger_major.any():
+                new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
+            elif trigger_minor_up.any() or trigger_minor_down.any():
+                work = slot_values.copy()
+                target_vals = total_val * slot_targets
+                majors = [j for j in slot_ids if mask_major[j]]       # counterparty pool: majors only
+                mode = ASYM_LOCAL_MODES[strategy_name]
+                for s in slot_ids:
+                    if not (trigger_minor_up[s] or trigger_minor_down[s]):
+                        continue
+                    need = target_vals[s] - work[s]                   # >0 补足 / <0 削减
+                    moved = _transfer_minor_vs_majors(work, target_vals, majors, s, need, mode)
+                    if moved > 0:
+                        reset_slots.add(s)
+                if reset_slots:
+                    new_slot_values, do_rebalance = work, True
 
         elif "RelDiff" in strategy_name:
             rel_diffs = np.abs(slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
@@ -395,6 +529,24 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     pnl_rec.update({f"{t}": f"{pct_pnl[t]:.2%}" for t in tickers})
 
     return pd.DataFrame(history), rebalance_count, pnl_rec
+
+
+def sample_monthly(final_data):
+    """Month-end sampling used by the app for windows >= 90 days.
+
+    Keeps the actual first row, then the last available row of each calendar
+    month (stamped at the calendar month-end label, the historical convention)
+    — EXCEPT the final bar: a partial last month keeps its real last data date
+    instead of a future month-end label. Stamping the last bar in the future
+    inflated the day-count in CAGR (up to ~29 days; material on short windows)
+    and plotted a not-yet-reached date on the charts.
+    """
+    first_row = final_data.iloc[[0]]
+    monthly_rows = final_data.resample('ME').last()
+    if len(monthly_rows) and monthly_rows.index[-1] > final_data.index[-1]:
+        monthly_rows = monthly_rows.rename(index={monthly_rows.index[-1]: final_data.index[-1]})
+    out = pd.concat([first_row, monthly_rows]).sort_index()
+    return out[~out.index.duplicated(keep='first')]
 
 
 def scrub_leading_glitches(price_data, max_drops=3, jump=5.0):

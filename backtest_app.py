@@ -10,16 +10,17 @@ from pathlib import Path
 
 from backtest_core import (
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
-    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
+    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM, STRAT_ASYM_LOCAL,
+    STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP,
     STRAT_LEGACY_MAP,
     clean_ticker, parse_portfolio, calculate_metrics,
     run_detailed_backtest, compute_annual_returns,
-    scrub_leading_glitches, scrub_isolated_spikes,
+    scrub_leading_glitches, scrub_isolated_spikes, sample_monthly,
 )
 
 # --- Version ---
-APP_VERSION = "1.3.3"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-06-30"
+APP_VERSION = "1.4.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-07-03"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -448,7 +449,8 @@ def render_annual_returns_table(comp_df, metrics):
 
 # --- 3. Sidebar: Global Settings ---
 SAVED_CONFIG_DIR = Path(__file__).parent / "Backtest"
-VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM}
+VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL,
+                STRAT_ASYM, STRAT_ASYM_LOCAL, STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP}
 
 def apply_config(loaded_config):
     """Apply an imported/saved config dict to session state and rerun."""
@@ -524,7 +526,8 @@ with st.sidebar:
 # --- 4. Main Area: Portfolio Config ---
 strategy_options = [
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
-    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM
+    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
+    STRAT_ASYM_LOCAL, STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP
 ]
 
 # Column headers
@@ -656,10 +659,7 @@ if st.session_state.run_backtest:
         if days_span < 90:
             price_df = final_data.copy()
         else:
-            first_row = final_data.iloc[[0]]
-            monthly_rows = final_data.resample('ME').last()
-            price_df = pd.concat([first_row, monthly_rows]).sort_index()
-            price_df = price_df[~price_df.index.duplicated(keep='first')]
+            price_df = sample_monthly(final_data)
 
         comp_df = pd.DataFrame(index=price_df.index)
         bench_nav = (price_df[bench_tk] / price_df[bench_tk].iloc[0]) * init_f
