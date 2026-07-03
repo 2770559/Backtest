@@ -203,22 +203,34 @@ def fetch_actual_data():
         # Rename columns back to our asset names
         rename = {v: k for k, v in TICKER_MAP.items()}
         close = close.rename(columns=rename)
+        # Keep US trading days only (all tickers are now ARCA-listed). ffill BEFORE
+        # taking the baseline row: a single missing print on the baseline day would
+        # otherwise make that asset's whole return series (and thus 组合) NaN.
+        close = close.dropna(how="all")
+        close = close.ffill()
         # Find baseline: last trading day on or before 2/27
         baseline_mask = close.index <= pd.Timestamp(WAR_START - timedelta(days=1))
         if not baseline_mask.any():
             baseline_prices = close.iloc[0]
         else:
             baseline_prices = close.loc[baseline_mask].iloc[-1]
-        # Keep US trading days only (all tickers are now ARCA-listed)
-        close = close.dropna(how="all")
-        close = close.ffill()
         # Cumulative return (%) from baseline
         returns_pct = ((close / baseline_prices) - 1) * 100
         # Filter to war period only (>= 2/28)
         returns_pct = returns_pct[returns_pct.index >= pd.Timestamp(WAR_START)]
         returns_pct = returns_pct.ffill()
-        available = [a for a in ASSETS if a in returns_pct.columns]
-        returns_pct["组合"] = sum(returns_pct[a] * WEIGHTS[a] for a in available)
+        # Weighted portfolio over assets that actually HAVE data, renormalized:
+        # a failed / all-NaN ticker must neither NaN-out the whole 组合 line nor
+        # silently understate it with weights summing < 1.
+        available = [a for a in ASSETS
+                     if a in returns_pct.columns and returns_pct[a].notna().any()]
+        missing = [a for a in ASSETS if a not in available]
+        if missing:
+            st.warning("实际数据缺少资产: " + ", ".join(missing) + "（组合线已按剩余权重归一化）")
+        wsum = sum(WEIGHTS[a] for a in available)
+        if not available or wsum <= 0:
+            return None
+        returns_pct["组合"] = sum(returns_pct[a] * (WEIGHTS[a] / wsum) for a in available)
         returns_pct = returns_pct.dropna(subset=["组合"])
         return returns_pct
     except Exception as e:
@@ -259,10 +271,13 @@ def get_actual_wide_at_dates(dates, series_list):
             # Future date: no actual data
             result[d] = {s: None for s in available}
         else:
-            idx = ACTUAL_DATA.index.get_indexer([ts], method="nearest")[0]
+            # as-of lookup (pad): never pull a FUTURE print onto an earlier label
+            idx = ACTUAL_DATA.index.get_indexer([ts], method="pad")[0]
             if 0 <= idx < len(ACTUAL_DATA):
                 row = ACTUAL_DATA.iloc[idx]
                 result[d] = {s: round(row[s], 2) if pd.notna(row.get(s)) else None for s in available}
+            else:
+                result[d] = {s: None for s in available}
     return result
 
 # Color palette
@@ -398,7 +413,8 @@ def build_long_df(scenario_keys, series_list):
     baseline_ts = pd.Timestamp(PREDICTION_BASELINE)
     if ACTUAL_DATA is not None and not ACTUAL_DATA.empty:
         # Get actual values at the fixed baseline date (3/20)
-        baseline_idx = ACTUAL_DATA.index.get_indexer([baseline_ts], method="nearest")[0]
+        # pad (as-of): if 3/20 is missing use the last print BEFORE it, never after
+        baseline_idx = ACTUAL_DATA.index.get_indexer([baseline_ts], method="pad")[0]
         baseline_actual_vals = ACTUAL_DATA.iloc[baseline_idx] if 0 <= baseline_idx < len(ACTUAL_DATA) else None
 
         if baseline_actual_vals is not None:
@@ -431,7 +447,10 @@ def build_long_df(scenario_keys, series_list):
                 asset = df.at[idx, "资产"]
                 ts = df.at[idx, "日期"]
                 if asset in ACTUAL_DATA.columns:
-                    ai = ACTUAL_DATA.index.get_indexer([ts], method="nearest")[0]
+                    # pad (as-of): weekend/holiday grid dates take the PRIOR trading
+                    # day; dates before the first actual print (e.g. 2/28 war start,
+                    # a Saturday) return -1 and keep the definitional prediction value.
+                    ai = ACTUAL_DATA.index.get_indexer([ts], method="pad")[0]
                     if 0 <= ai < len(ACTUAL_DATA):
                         val = ACTUAL_DATA.iloc[ai][asset]
                         if pd.notna(val):
