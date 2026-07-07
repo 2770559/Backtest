@@ -35,6 +35,8 @@ python3 -m unittest discover -s tests          # 单元测试
 
 相对偏离 = |当前权重 − 目标权重| / 目标权重，阈值 `Thr%` 按百分比输入。带符号相对偏差 =（当前权重 − 目标权重）/ 目标权重，正为超配、负为欠配。
 
+**分槽位阈值（API 级，v1.5.0）**：`run_detailed_backtest` 的 `threshold` 可传 dict `{slot_id: thr, "*": 默认}`，对不同槽位使用不同触发带（如加密槽窄带、核心槽宽带）。UI 仍为单一 Thr%。标量路径决策逐位不变。
+
 ### 聚合标的（Composite Tickers）
 
 一个权重槽位可由多个元素组成，在 `Tickers` 里用括号声明，对应一个权重：

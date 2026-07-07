@@ -330,6 +330,44 @@ class TestAsymLocalVariants(unittest.TestCase):
             self.assertEqual(cnt, 0)
 
 
+class TestPerSlotThreshold(unittest.TestCase):
+    """threshold may be a dict {slot_id: thr, '*': default} for per-slot bands."""
+
+    @staticmethod
+    def _df(cols, start="2020-01-31"):
+        n = len(next(iter(cols.values())))
+        idx = pd.date_range(start, periods=n, freq="ME")
+        return pd.DataFrame(cols, index=idx)
+
+    def test_scalar_equals_uniform_dict_bit_identical(self):
+        w = pd.Series([0.6, 0.3, 0.1], index=["A", "B", "C"])
+        price = self._df({"A": [100, 130, 90, 120], "B": [100, 95, 105, 80],
+                          "C": [100, 160, 60, 130]})
+        from backtest_core import STRAT_RD_MIXED, STRAT_RD_LOCAL
+        for strat in (STRAT_RD_FULL, STRAT_RD_MIXED, STRAT_RD_LOCAL, STRAT_ASYM, STRAT_ASYM_LOCAL):
+            a = run_detailed_backtest(strat, price, w, 10000, 0.4)
+            b = run_detailed_backtest(strat, price, w, 10000, {"*": 0.4})
+            pd.testing.assert_frame_equal(a[0], b[0], check_exact=True)
+            self.assertEqual(a[1], b[1])
+
+    def test_tight_band_on_one_slot_triggers_alone(self):
+        # C +30%: inside the global 40% band, outside its own 20% band.
+        # With {'C': .2, '*': .4} the portfolio must rebalance; with scalar .4 not.
+        from backtest_core import STRAT_RD_MIXED
+        w = pd.Series([0.6, 0.3, 0.1], index=["A", "B", "C"])
+        price = self._df({"A": [100, 100], "B": [100, 100], "C": [100, 130]})
+        _, cnt_scalar, _ = run_detailed_backtest(STRAT_RD_MIXED, price, w, 10000, 0.4)
+        _, cnt_dict, _ = run_detailed_backtest(STRAT_RD_MIXED, price, w, 10000, {"C": 0.2, "*": 0.4})
+        self.assertEqual(cnt_scalar, 0)
+        self.assertEqual(cnt_dict, 1)
+
+    def test_missing_slot_without_default_raises(self):
+        w = pd.Series([0.5, 0.5], index=["A", "B"])
+        price = self._df({"A": [100, 100], "B": [100, 100]})
+        with self.assertRaises(ValueError):
+            run_detailed_backtest(STRAT_RD_FULL, price, w, 10000, {"A": 0.4})
+
+
 class TestSampleMonthly(unittest.TestCase):
     def test_final_partial_month_keeps_real_last_date(self):
         idx = pd.date_range("2020-01-02", "2020-07-02", freq="B")

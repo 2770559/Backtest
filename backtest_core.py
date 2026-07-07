@@ -342,6 +342,11 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
     groups=None  ==  every column is its own slot  ==  original behaviour,
     bit-identical (singletons short-circuit the unfold; see below).
+
+    threshold: float, or dict {slot_id: thr} for PER-SLOT bands (slot_id = the
+    ticker for singleton slots / the groups value for composites). "*" supplies
+    the default for unlisted slots and is required if any slot is missing.
+    A scalar is broadcast — decisions are bit-identical to the original code.
     """
     tickers = price_df.columns
     if price_df.empty: return pd.DataFrame(), 0, {}
@@ -364,6 +369,14 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
     # Slot-level targets = SUM of member element targets (singleton -> itself).
     slot_targets = target_weights.groupby(slot_of).sum().reindex(slot_ids)
+
+    # Normalize threshold: scalar stays scalar (broadcasts bit-identically);
+    # a dict becomes a Series aligned to slot_ids ("*" = default band).
+    if isinstance(threshold, dict):
+        missing = [s for s in slot_ids if s not in threshold]
+        if missing and "*" not in threshold:
+            raise ValueError(f"threshold dict missing slots {missing} and no '*' default")
+        threshold = pd.Series({s: float(threshold.get(s, threshold.get("*"))) for s in slot_ids})
 
     # Per-element initial weights = slot target split EQUALLY among its members.
     member_counts = slot_of.map(slot_of.value_counts())            # aligned to columns
@@ -470,7 +483,9 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
         elif "RelDiff" in strategy_name:
             rel_diffs = np.abs(slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
-            if rel_diffs.max() > threshold:
+            # (rel_diffs > threshold).any() == rel_diffs.max() > threshold for a
+            # scalar; the elementwise form also supports per-slot bands.
+            if (rel_diffs > threshold).any():
                 if strategy_name == STRAT_RD_FULL:
                     new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
                 elif strategy_name == STRAT_RD_MIXED:

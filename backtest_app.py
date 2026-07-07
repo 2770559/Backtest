@@ -19,8 +19,8 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "1.4.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-07-03"
+APP_VERSION = "1.5.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-07-06"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -257,19 +257,21 @@ if 'init_funds' not in st.session_state: st.session_state['init_funds'] = 10000
 if 'portfolios_list' not in st.session_state:
     st.session_state.portfolios_list = [
         {
+            # Crypto sleeve split into a composite (ETH-USD, MSTR): same 5% slot ->
+            # 2.5% / 2.5%. Rebalanced with RelDiff Mixed at a 40% trigger band.
             "id": str(uuid.uuid4()),
             "name": "Port A",
-            "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD",
+            "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
-            "strat": STRAT_ASYM,
-            "thr": 38
+            "strat": STRAT_RD_MIXED,
+            "thr": 40
         },
         {
-            # Port A with the ETH-USD sleeve split into a composite (ETH-USD, MSTR),
-            # same 5% slot -> 2.5% / 2.5%. Everything else identical to Port A.
+            # Port A with the crypto sleeve as a plain ETH-USD slot (5%), rebalanced
+            # with Asymmetric RelDiff at a 38% trigger band. Weights identical to Port A.
             "id": str(uuid.uuid4()),
             "name": "Port B",
-            "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
+            "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
             "strat": STRAT_ASYM,
             "thr": 38
@@ -565,7 +567,7 @@ with btn_cols[0]:
         st.session_state.portfolios_list.append({
             "id": str(uuid.uuid4()), "name": f"Port {chr(new_char_code)}",
             "tickers": last_port["tickers"], "weights": last_port["weights"],
-            "strat": STRAT_ASYM, "thr": 38
+            "strat": STRAT_RD_MIXED, "thr": 40
         })
         st.rerun()
 with btn_cols[1]:
