@@ -25,8 +25,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backtest_core import (
-    STRAT_BH, STRAT_RD_FULL, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_ASYM, STRAT_ASYM_LOCAL,
-    STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP,
+    STRAT_BH, STRAT_RD_FULL, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_ASYM,
     parse_portfolio, run_detailed_backtest,
 )
 
@@ -150,31 +149,6 @@ class TestEngineComposite(unittest.TestCase):
         post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
         self.assertEqual(post["A"], post["B"])    # slot reset -> equal split
 
-    def test_asym_local_minor_composite_trims_via_majors_and_resets_split(self):
-        # ASYM_LOCAL with a composite MINOR slot Z=(C, D) at 5% (2.5%/2.5%) plus a
-        # standalone non-triggered minor W at 5%. C x3, D x5 -> Z breaches minor-up.
-        # Its excess is trimmed ONLY into the under-weight majors, most-deviated
-        # first and each capped at its target: X fills to 65% then Y takes the rest
-        # but stays BELOW its 25% target (partial, cap not reached) -> proves this
-        # is a local cascade, not a global reset. Z restores its EQUAL split
-        # (C == D though they drifted apart); the non-triggered minor W is untouched.
-        w = pd.Series([0.65, 0.25, 0.025, 0.025, 0.05], index=["X", "Y", "C", "D", "W"])
-        groups = {"C": "Z", "D": "Z"}
-        price = _price_df({"X": [100, 100], "Y": [100, 100],
-                           "C": [100, 300], "D": [100, 500], "W": [100, 160]})
-        hist, cnt, _ = run_detailed_backtest(STRAT_ASYM_LOCAL, price, w, 10000, 0.5, groups=groups)
-        self.assertEqual(cnt, 1)
-        pre = hist[hist["Type"] == "Pre-Rebal"].iloc[0]
-        post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
-        self.assertEqual(post["C"], post["D"])                 # composite slot reset -> equal split
-        self.assertEqual(post["C"], "2.50%")                   # ... back to the 2.5% default
-        self.assertNotEqual(post["C"], pre["C"])               # pre-trim it had drifted (6.36%)
-        self.assertEqual(post["X"], "65.00%")                  # first major filled to cap
-        self.assertLess(float(post["Y"].rstrip("%")), 25.0)    # cascade left Y below target (local)
-        self.assertGreater(float(post["Y"].rstrip("%")), float(pre["Y"].rstrip("%")))
-        self.assertEqual(post["W"], pre["W"])                  # non-triggered minor untouched
-
-
 class TestNoCompositeRegression(unittest.TestCase):
     """Locks: the composite machinery must NOT perturb the legacy path."""
 
@@ -188,8 +162,7 @@ class TestNoCompositeRegression(unittest.TestCase):
         self.assertIsNone(out[3])
 
     def test_groups_none_equals_no_arg_bit_identical(self):
-        for strat in (STRAT_BH, STRAT_RD_FULL, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_ASYM,
-                      STRAT_ASYM_LOCAL, STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP):
+        for strat in (STRAT_BH, STRAT_RD_FULL, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_ASYM):
             a = run_detailed_backtest(strat, self.price, self.w, 10000, 0.5)
             b = run_detailed_backtest(strat, self.price, self.w, 10000, 0.5, groups=None)
             pd.testing.assert_frame_equal(a[0], b[0], check_exact=True)

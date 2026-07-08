@@ -10,8 +10,7 @@ from pathlib import Path
 
 from backtest_core import (
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
-    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM, STRAT_ASYM_LOCAL,
-    STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP,
+    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
     STRAT_LEGACY_MAP,
     clean_ticker, parse_portfolio, calculate_metrics,
     run_detailed_backtest, compute_annual_returns,
@@ -19,8 +18,8 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "1.5.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-07-06"
+APP_VERSION = "2.0.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-07-08"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -452,7 +451,7 @@ def render_annual_returns_table(comp_df, metrics):
 # --- 3. Sidebar: Global Settings ---
 SAVED_CONFIG_DIR = Path(__file__).parent / "Backtest"
 VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL,
-                STRAT_ASYM, STRAT_ASYM_LOCAL, STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP}
+                STRAT_ASYM}
 
 def apply_config(loaded_config):
     """Apply an imported/saved config dict to session state and rerun."""
@@ -528,8 +527,7 @@ with st.sidebar:
 # --- 4. Main Area: Portfolio Config ---
 strategy_options = [
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
-    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
-    STRAT_ASYM_LOCAL, STRAT_ASYM_LOCAL_EQ, STRAT_ASYM_LOCAL_PROP
+    STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM
 ]
 
 # Column headers
