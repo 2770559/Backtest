@@ -256,11 +256,14 @@ class TestAppSmoke(unittest.TestCase):
     def test_invalid_input_after_run_shows_error_not_crash(self):
         from streamlit.testing.v1 import AppTest
         at = AppTest.from_file(self.APP)
-        at.run(timeout=60)
-        # Simulate: user already ran a backtest, then edits weights to garbage.
-        # Re-validation must stop with st.error instead of raising on float().
-        pid = at.session_state["portfolios_list"][0]["id"]
-        at.text_input(key=f"w_{pid}").set_value("0.5, abc")
+        # Weight-FORMAT garbage can no longer be typed (the allocation matrix is
+        # a typed editor); an unparseable weight in a loaded config degrades to
+        # "not held", leaving a weights-sum violation. The re-validation gate
+        # must stop with st.error instead of crashing the results block.
+        at.session_state["portfolios_list"] = [{
+            "id": "smoke1", "name": "P1", "tickers": "QQQM, SPY",
+            "weights": "0.5, abc", "strat": "RelDiff Mixed", "thr": 40,
+        }]
         at.session_state["run_backtest"] = True
         at.run(timeout=60)
         self.assertFalse(at.exception)

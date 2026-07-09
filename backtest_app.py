@@ -3,10 +3,17 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import altair as alt
+import requests
 import uuid
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+
+try:
+    from streamlit_searchbox import st_searchbox
+    HAS_SEARCHBOX = True
+except ImportError:            # optional dependency: matrix still accepts typed tickers
+    HAS_SEARCHBOX = False
 
 from backtest_core import (
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
@@ -15,208 +22,256 @@ from backtest_core import (
     clean_ticker, parse_portfolio, calculate_metrics,
     run_detailed_backtest, compute_annual_returns,
     scrub_leading_glitches, scrub_isolated_spikes, sample_monthly,
+    _split_top_level,
 )
 
 # --- Version ---
-APP_VERSION = "2.0.0"  # semver: major.minor.patch
+APP_VERSION = "2.1.0"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-08"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
 
-# --- Custom CSS: KPI Dashboard + Responsive Design ---
+# --- Theme & series palette ---
+def _theme_type():
+    """Active Streamlit theme type; safe fallback for AppTest / bare mode."""
+    try:
+        t = st.context.theme.type
+    except Exception:
+        t = None
+    return t if t in ("light", "dark") else "light"
+
+THEME = _theme_type()
+
+# Categorical series palette (dataviz six-checks validated: light set on #ffffff,
+# dark set on #0e1117). Slot ORDER is the CVD-safety mechanism — never re-sort.
+# Color follows the ENTITY: each portfolio keeps its slot from the editor row
+# index across charts, cards and tables, even if another portfolio is dropped.
+CAT_LIGHT = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948", "#e87ba4", "#eb6834"]
+CAT_DARK  = ["#3987e5", "#199e70", "#c98500", "#008300", "#9085e9", "#e66767", "#d55181", "#d95926"]
+SERIES_COLORS = CAT_DARK if THEME == "dark" else CAT_LIGHT
+BENCH_COLOR = "#898781"   # benchmark = neutral context line (dashed), not a competing identity
+
+_T = {
+    "light": {
+        "card": "#ffffff", "subtle": "#f6f8fa", "ink1": "#1a1a2e", "ink2": "#52514e",
+        "muted": "#898781", "border": "rgba(11,11,11,0.10)", "grid": "#e5e7eb",
+        "good": "#006300", "bad": "#d03b3b",
+        "shadow": "0 1px 4px rgba(15,23,42,0.06)", "hover": "0 6px 16px rgba(15,23,42,0.12)",
+    },
+    "dark": {
+        "card": "#1b1f27", "subtle": "#262b36", "ink1": "#fafafa", "ink2": "#c3c2b7",
+        "muted": "#898781", "border": "rgba(255,255,255,0.12)", "grid": "#2c2f36",
+        "good": "#0ca30c", "bad": "#e66767",
+        "shadow": "0 1px 4px rgba(0,0,0,0.35)", "hover": "0 6px 16px rgba(0,0,0,0.45)",
+    },
+}[THEME]
+
+st.markdown(
+    "<style>:root{"
+    + "".join(f"--{k}:{v};" for k, v in _T.items())
+    + "}</style>",
+    unsafe_allow_html=True,
+)
+
+# --- Custom CSS (all colors via :root design tokens -> theme-aware) ---
 st.markdown("""
 <style>
-/* ===== Global Typography & Spacing (responsive-design skill) ===== */
+/* ===== Global ===== */
 section.main > div { max-width: 1400px; margin: 0 auto; }
-
 h1, h2, h3, h4 { letter-spacing: -0.02em; }
 
 /* ===== Header Bar ===== */
 .header-bar {
     background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
     color: white;
-    padding: 1.25rem 1.75rem;
+    padding: 1.1rem 1.6rem;
     border-radius: 0.75rem;
-    margin-bottom: 1.25rem;
+    margin-bottom: 1.1rem;
     display: flex;
     justify-content: space-between;
     align-items: center;
     flex-wrap: wrap;
     gap: 0.5rem;
 }
-.header-bar h2 { margin: 0; font-size: clamp(1.1rem, 2.5vw, 1.5rem); font-weight: 700; }
-.header-bar .subtitle { opacity: 0.7; font-size: 0.85rem; }
+.header-bar h2 { margin: 0; font-size: clamp(1.05rem, 2.5vw, 1.4rem); font-weight: 700; color: #fff; }
+.header-bar .subtitle { opacity: 0.65; font-size: 0.83rem; }
 .header-bar .version-badge {
-    background: rgba(255,255,255,0.15);
-    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.13);
+    border: 1px solid rgba(255,255,255,0.22);
     border-radius: 1rem;
     padding: 0.2rem 0.75rem;
-    font-size: 0.75rem;
+    font-size: 0.73rem;
     font-weight: 600;
     letter-spacing: 0.03em;
     white-space: nowrap;
 }
 
-/* ===== KPI Metric Cards (kpi-dashboard-design skill) ===== */
-.kpi-row {
-    display: grid;
-    grid-template-columns: repeat(6, 1fr);
-    gap: 0.75rem;
-    margin-bottom: 1rem;
-}
-@media (max-width: 900px) {
-    .kpi-row { grid-template-columns: repeat(3, 1fr); }
-}
-@media (max-width: 600px) {
-    .kpi-row { grid-template-columns: repeat(2, 1fr); }
+/* ===== Section label ===== */
+.sec-label {
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink2);
+    margin: 0.25rem 0 0.35rem 0;
 }
 
-.kpi-card {
-    background: #ffffff;
-    border-radius: 0.6rem;
-    padding: 0.875rem 1rem;
-    border-left: 4px solid #e0e0e0;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-    transition: transform 0.15s, box-shadow 0.15s;
-}
-.kpi-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-}
-.kpi-card .label {
+/* ===== Portfolio editor ===== */
+.col-cap {
     font-size: 0.72rem;
-    color: #666;
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    margin-bottom: 0.25rem;
-    font-weight: 600;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
-.kpi-card .value {
-    font-size: clamp(1rem, 2vw, 1.35rem);
-    font-weight: 700;
-    color: #1a1a2e;
-    line-height: 1.2;
-}
-
-/* Border color variants */
-.kpi-card.green  { border-left-color: #10b981; }
-.kpi-card.red    { border-left-color: #ef4444; }
-.kpi-card.blue   { border-left-color: #3b82f6; }
-.kpi-card.purple { border-left-color: #8b5cf6; }
-.kpi-card.amber  { border-left-color: #f59e0b; }
-.kpi-card.gray   { border-left-color: #6b7280; }
-
-/* ===== Portfolio Group Title ===== */
-.port-title {
-    font-size: 0.95rem;
-    font-weight: 700;
-    color: #1a1a2e;
-    padding: 0.5rem 0.75rem;
-    background: #f1f5f9;
-    border-radius: 0.4rem;
-    margin: 0.75rem 0 0.5rem 0;
+.row-dot {
     display: inline-block;
+    width: 11px; height: 11px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
 }
-.port-title.bench { background: #e0e7ff; color: #3730a3; }
 
-/* ===== Comparison Table ===== */
+/* ===== Summary cards (one per series; hero = annualized return) ===== */
+.sum-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+    gap: 0.75rem;
+    margin: 0.25rem 0 0.75rem 0;
+}
+.sum-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-top: 3px solid var(--pc);
+    border-radius: 0.65rem;
+    padding: 0.8rem 0.95rem 0.7rem 0.95rem;
+    box-shadow: var(--shadow);
+    transition: transform 0.12s, box-shadow 0.15s;
+}
+.sum-card:hover { transform: translateY(-2px); box-shadow: var(--hover); }
+.sum-head {
+    display: flex; align-items: center; gap: 0.45rem;
+    font-size: 0.82rem; font-weight: 700; color: var(--ink1);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sum-head .dot {
+    flex: none; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--pc);
+}
+.sum-hero {
+    font-size: clamp(1.35rem, 2.2vw, 1.7rem);
+    font-weight: 750;
+    line-height: 1.15;
+    margin: 0.35rem 0 0.45rem 0;
+    color: var(--ink1);
+}
+.sum-hero.pos { color: var(--good); }
+.sum-hero.neg { color: var(--bad); }
+.sum-hero .per { font-size: 0.75rem; font-weight: 600; color: var(--muted); }
+.sum-minis {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.2rem 0.75rem;
+    padding-top: 0.45rem;
+    border-top: 1px solid var(--border);
+}
+.sum-minis > div { display: flex; justify-content: space-between; gap: 0.5rem; }
+.sum-minis .k { font-size: 0.7rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.sum-minis .v { font-size: 0.78rem; color: var(--ink1); font-weight: 600; font-variant-numeric: tabular-nums; }
+.sum-foot {
+    margin-top: 0.4rem;
+    font-size: 0.72rem;
+    color: var(--ink2);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ===== Comparison / annual tables ===== */
 .cmp-table {
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
     font-size: 0.85rem;
-    margin: 0.75rem 0 1.25rem 0;
+    margin: 0.5rem 0 0.75rem 0;
     border-radius: 0.5rem;
     overflow: hidden;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    border: 1px solid var(--border);
 }
 .cmp-table th {
-    background: #f8fafc;
-    padding: 0.6rem 1rem;
+    background: var(--subtle);
+    padding: 0.55rem 1rem;
     text-align: left;
     font-weight: 600;
-    color: #475569;
-    border-bottom: 2px solid #e2e8f0;
+    color: var(--ink2);
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+}
+.cmp-table th .th-dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    margin-right: 0.45rem; vertical-align: baseline;
 }
 .cmp-table td {
-    padding: 0.55rem 1rem;
-    border-bottom: 1px solid #f1f5f9;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--ink1);
+    font-variant-numeric: tabular-nums;
 }
 .cmp-table tr:last-child td { border-bottom: none; }
-.cmp-table tr:hover td { background: #f8fafc; }
-.cmp-table .best { color: #10b981; font-weight: 700; }
-.cmp-table .worst { color: #ef4444; }
-.cmp-table .cagr-row td { background: #f8fafc; font-weight: 600; border-top: 2px solid #e2e8f0; }
+.cmp-table tr:hover td { background: var(--subtle); }
+.cmp-table .best { color: var(--good); font-weight: 700; }
+.cmp-table .worst { color: var(--bad); }
+.cmp-table .cagr-row td { background: var(--subtle); font-weight: 600; border-top: 2px solid var(--border); }
 
-/* ===== Portfolio Config Cards ===== */
-.config-card {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 0.6rem;
-    padding: 0.75rem 1rem;
-    margin-bottom: 0.5rem;
+/* ===== Allocation sums line ===== */
+.alloc-sums {
+    font-size: 0.78rem;
+    margin: 0.15rem 0 0.5rem 0.2rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink2);
 }
 
-/* ===== Section Divider ===== */
-.section-gap { margin: 1.5rem 0 0.75rem 0; }
-
-/* ===== Hide default Streamlit metric styling for cleaner look ===== */
-[data-testid="stMetric"] {
-    background: #f8fafc;
-    border-radius: 0.5rem;
-    padding: 0.75rem;
-    border-left: 3px solid #3b82f6;
+/* ===== Empty state ===== */
+.empty-state {
+    border: 1.5px dashed var(--border);
+    border-radius: 0.75rem;
+    padding: 2.2rem 1.5rem;
+    text-align: center;
+    color: var(--ink2);
+    margin-top: 0.75rem;
 }
+.empty-state .es-icon { font-size: 1.9rem; margin-bottom: 0.4rem; }
+.empty-state .es-title { font-weight: 700; color: var(--ink1); margin-bottom: 0.3rem; }
+.empty-state .es-body { font-size: 0.86rem; max-width: 560px; margin: 0 auto; line-height: 1.55; }
 
-/* ===== Button Styling ===== */
-/* Delete button: compact red circle */
-button[kind="secondary"][data-testid="stBaseButton-secondary"]:has(p) {
-    /* fallback handled by .del-btn class below */
-}
+/* ===== Section divider ===== */
+.section-gap { margin: 1.25rem 0 0.6rem 0; }
 
-/* Primary action button (Analyze) — match secondary button size */
+/* ===== Buttons ===== */
 button[kind="primary"] {
     border-radius: 0.5rem !important;
     font-weight: 600 !important;
-    font-size: inherit !important;
     letter-spacing: 0.02em;
-    padding: 0.5rem 1.5rem !important;
-    min-height: 0 !important;
-    line-height: normal !important;
     transition: transform 0.1s, box-shadow 0.15s !important;
-}
-button[kind="primary"] div {
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    gap: 0.35rem !important;
-    flex-direction: row !important;
-}
-button[kind="primary"] p {
-    display: inline !important;
-    margin: 0 !important;
 }
 button[kind="primary"]:hover {
     transform: translateY(-1px) !important;
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35) !important;
+    box-shadow: var(--hover) !important;
 }
-
-/* Secondary buttons (Add Portfolio, etc.) */
 button[kind="secondary"] {
     border-radius: 0.5rem !important;
-    border: 1.5px solid #e2e8f0 !important;
     transition: all 0.15s !important;
 }
-button[kind="secondary"]:hover {
-    border-color: #3b82f6 !important;
-    color: #3b82f6 !important;
-    background: #eff6ff !important;
-}
 
-/* ===== Sidebar refinements ===== */
-section[data-testid="stSidebar"] > div:first-child {
-    padding-top: 1.5rem;
+/* ===== Sidebar ===== */
+section[data-testid="stSidebar"] > div:first-child { padding-top: 1.25rem; }
+section[data-testid="stSidebar"] h3 {
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink2);
 }
 </style>
 """, unsafe_allow_html=True)
@@ -228,7 +283,7 @@ st.markdown(f"""
         <h2>Portfolio Backtest & Rebalance Analyzer</h2>
         <div class="subtitle">Multi-portfolio backtesting with rebalancing strategies</div>
     </div>
-    <div class="version-badge">v{APP_VERSION}</div>
+    <div class="version-badge">v{APP_VERSION} · {APP_BUILD_DATE}</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -259,15 +314,15 @@ if 'portfolios_list' not in st.session_state:
             # Crypto sleeve split into a composite (ETH-USD, MSTR): same 5% slot ->
             # 2.5% / 2.5%. Rebalanced with RelDiff Mixed at a 40% trigger band.
             "id": str(uuid.uuid4()),
-            "name": "Port A",
+            "name": "AV-US",
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
             "strat": STRAT_RD_MIXED,
             "thr": 40
         },
         {
-            # Port A with the crypto sleeve as a plain ETH-USD slot (5%), rebalanced
-            # with Asymmetric RelDiff at a 38% trigger band. Weights identical to Port A.
+            # AV-US with the crypto sleeve as a plain ETH-USD slot (5%), rebalanced
+            # with Asymmetric RelDiff at a 38% trigger band. Weights identical to AV-US.
             "id": str(uuid.uuid4()),
             "name": "Port B",
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD",
@@ -301,6 +356,8 @@ def validate_inputs(portfolios, benchmark):
     if not str(benchmark).strip():
         errors.append("Benchmark ticker is empty")
     names = [p['name'] for p in portfolios]
+    if any(not str(n).strip() for n in names):
+        errors.append("Portfolio name is empty")
     dup_names = sorted({n for n in names if names.count(n) > 1})
     if dup_names:
         errors.append("Duplicate portfolio names: " + ", ".join(dup_names))
@@ -308,6 +365,92 @@ def validate_inputs(portfolios, benchmark):
         _, _, perrs, _ = parse_portfolio(p)
         errors.extend(f"**{p['name']}**: {e}" for e in perrs)
     return errors
+
+# --- Allocation matrix (Portfolio-Visualizer style editor) ------------------
+# The matrix is a VIEW over the stored per-portfolio tickers/weights strings:
+# rows = slot tokens (a ticker or a "(A, B)" composite group), one weight column
+# per portfolio in PERCENT, blank/0 = not held. Storage, JSON export/import and
+# saved configs keep the legacy string format unchanged.
+
+def _slot_tokens(tickers_str):
+    """Split a tickers string into slot tokens, respecting ( ) groups."""
+    s = str(tickers_str or "").replace("，", ",").replace("（", "(").replace("）", ")")
+    tokens, err = _split_top_level(s, ",")
+    if err:
+        tokens = s.split(",")   # unbalanced parens: degrade gracefully, validated on Analyze
+    return [t.strip() for t in tokens if t.strip()]
+
+
+def build_alloc_df(ports):
+    """portfolios -> DataFrame(Asset | <name>% per portfolio), union of slots."""
+    slots, weights = [], {}
+    for p in ports:
+        tokens = _slot_tokens(p.get("tickers", ""))
+        w_raw = [w.strip() for w in str(p.get("weights", "")).replace("，", ",").split(",") if w.strip()]
+        for i, tok in enumerate(tokens):
+            if tok not in weights:
+                weights[tok] = {}
+                slots.append(tok)
+            try:
+                weights[tok][p["id"]] = float(w_raw[i]) * 100 if i < len(w_raw) else None
+            except ValueError:
+                weights[tok][p["id"]] = None
+    data = {"Asset": slots}
+    for p in ports:
+        data[p["name"]] = [weights[tok].get(p["id"]) for tok in slots]
+    return pd.DataFrame(data)
+
+
+def sync_alloc(df, ports):
+    """Write the edited matrix back into each portfolio's tickers/weights strings."""
+    for p in ports:
+        if p["name"] not in df.columns:
+            continue
+        tks, wts = [], []
+        for _, row in df.iterrows():
+            tok = str(row["Asset"] if pd.notna(row["Asset"]) else "").strip()
+            w = row[p["name"]]
+            if not tok or pd.isna(w) or w == 0:
+                continue
+            tks.append(tok)
+            wts.append(f"{w / 100:g}")
+        p["tickers"] = ", ".join(tks)
+        p["weights"] = ", ".join(wts)
+
+
+def _alloc_struct_key(ports):
+    """Editor key: changes when portfolios are added/removed/renamed (or an
+    asset is added via search — see _alloc_nonce), which re-anchors the
+    editor's edit-state on a freshly built base DataFrame."""
+    nonce = st.session_state.get("_alloc_nonce", 0)
+    return f"alloc_{abs(hash(tuple((p['id'], p['name']) for p in ports)))}_{nonce}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def yahoo_symbol_search(query):
+    """Ticker/fund-name typeahead via Yahoo's symbol-search endpoint.
+    Returns [(label, symbol), ...]; [] on any failure (search is best-effort)."""
+    q = str(query or "").strip()
+    if len(q) < 2:
+        return []
+    try:
+        r = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": q, "quotesCount": 10, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        quotes = r.json().get("quotes", [])
+    except Exception:
+        return []
+    out = []
+    for it in quotes:
+        sym = it.get("symbol")
+        if not sym:
+            continue
+        name = it.get("shortname") or it.get("longname") or ""
+        tail = " · ".join(x for x in (it.get("quoteType"), it.get("exchange")) if x)
+        out.append((f"{name} ({sym})" + (f" · {tail}" if tail else ""), sym))
+    return out
+
 
 @st.cache_data(ttl=86400)
 def fetch_cpi_data():
@@ -319,48 +462,46 @@ def fetch_cpi_data():
     except Exception:
         return None
 
-def render_kpi_cards(name, m, is_bench=False):
-    """Render a row of styled KPI cards (kpi-dashboard-design pattern)"""
-    title_cls = "bench" if is_bench else ""
-    st.markdown(f'<div class="port-title {title_cls}">{name}</div>', unsafe_allow_html=True)
+def render_summary_cards(metrics, color_map):
+    """One compact card per series: identity dot + name, hero = annualized
+    return (sign-colored), mini stats grid, final value footer. Replaces the
+    old per-portfolio 6-card KPI rows so the chart lands above the fold."""
+    cards = []
+    for m in metrics:
+        pc = color_map.get(m["name"], BENCH_COLOR)
+        ann = m.get("_ann_ret")
+        if m["ann_ret"] in ("-", "Err"):
+            hero, pol, per = m["ann_ret"], "", ""
+        else:
+            hero = f"{ann:+.2%}"
+            pol = "pos" if ann >= 0 else "neg"
+            per = '<span class="per"> /yr</span>'
+        total = f"{m['_total_ret']:+.2%}" if m["total_ret"] not in ("-", "Err") else m["total_ret"]
+        final = f"Final ${m['final_nav']}" if m["final_nav"] not in ("-", "Err") else "—"
+        cards.append(
+            f'<div class="sum-card" style="--pc:{pc}">'
+            f'<div class="sum-head"><span class="dot"></span>{m["name"]}</div>'
+            f'<div class="sum-hero {pol}">{hero}{per}</div>'
+            f'<div class="sum-minis">'
+            f'<div><span class="k">Total</span><span class="v">{total}</span></div>'
+            f'<div><span class="k">Max DD</span><span class="v">{m["max_dd"]}</span></div>'
+            f'<div><span class="k">Sharpe</span><span class="v">{m["sharpe"]}</span></div>'
+            f'<div><span class="k">Rebal</span><span class="v">{m["rebal_cnt"]}</span></div>'
+            f'</div>'
+            f'<div class="sum-foot">{final}</div>'
+            f'</div>'
+        )
+    st.markdown(f'<div class="sum-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
-    # Determine card colors based on values
-    ret_color = "green" if isinstance(m.get("_total_ret"), (int, float)) and m["_total_ret"] > 0 else "red"
-    ann_color = "green" if isinstance(m.get("_ann_ret"), (int, float)) and m["_ann_ret"] > 0 else "red"
-    dd_color = "red" if isinstance(m.get("_max_dd"), (int, float)) and m["_max_dd"] < -0.2 else "amber"
-    sharpe_color = "green" if isinstance(m.get("_sharpe"), (int, float)) and m["_sharpe"] > 1 else ("amber" if isinstance(m.get("_sharpe"), (int, float)) and m["_sharpe"] > 0 else "red")
 
-    cards_html = f"""
-    <div class="kpi-row">
-        <div class="kpi-card blue">
-            <div class="label">Final Value</div>
-            <div class="value">${m['final_nav']}</div>
-        </div>
-        <div class="kpi-card {ret_color}">
-            <div class="label">Total Return</div>
-            <div class="value">{m['total_ret']}</div>
-        </div>
-        <div class="kpi-card {ann_color}">
-            <div class="label">Ann. Return</div>
-            <div class="value">{m['ann_ret']}</div>
-        </div>
-        <div class="kpi-card {dd_color}">
-            <div class="label">Max Drawdown</div>
-            <div class="value">{m['max_dd']}</div>
-        </div>
-        <div class="kpi-card {sharpe_color}">
-            <div class="label">Sharpe Ratio</div>
-            <div class="value">{m['sharpe']}</div>
-        </div>
-        <div class="kpi-card gray">
-            <div class="label">Rebalances</div>
-            <div class="value">{m['rebal_cnt']}</div>
-        </div>
-    </div>
-    """
-    st.markdown(cards_html, unsafe_allow_html=True)
+def _series_th(name, color_map):
+    """Table header cell with the series' identity dot."""
+    c = color_map.get(name)
+    dot = f'<span class="th-dot" style="background:{c}"></span>' if c else ""
+    return f"<th>{dot}{name}</th>"
 
-def render_comparison_table(metrics):
+
+def render_comparison_table(metrics, color_map):
     """Render a side-by-side comparison table (kpi-dashboard-design: executive summary pattern)"""
     if len(metrics) < 2:
         return
@@ -373,7 +514,7 @@ def render_comparison_table(metrics):
 
     header = "<tr><th>Metric</th>"
     for m in metrics:
-        header += f"<th>{m['name']}</th>"
+        header += _series_th(m["name"], color_map)
     header += "</tr>"
 
     rows = ""
@@ -402,14 +543,14 @@ def render_comparison_table(metrics):
     st.markdown(f'<table class="cmp-table">{header}{rows}</table>', unsafe_allow_html=True)
 
 
-def render_annual_returns_table(comp_df, metrics):
+def render_annual_returns_table(comp_df, metrics, color_map):
     """HTML table: rows = calendar years (newest first) + CAGR; cols = each series in comp_df."""
     rows_data = compute_annual_returns(comp_df)
     if not rows_data:
         return
     cols = list(comp_df.columns)
 
-    header = "<tr><th>Year</th>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
+    header = "<tr><th>Year</th>" + "".join(_series_th(c, color_map) for c in cols) + "</tr>"
 
     body = ""
     for r in sorted(rows_data, key=lambda x: -x["year"]):
@@ -530,53 +671,131 @@ strategy_options = [
     STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM
 ]
 
-# Column headers
-hdr = st.columns([0.8, 3, 2, 2, 0.8, 0.4])
-with hdr[0]: st.caption("Name")
-with hdr[1]: st.caption("Tickers  ·  group with ( ) for composites")
-with hdr[2]: st.caption("Weights")
-with hdr[3]: st.caption("Strategy")
-with hdr[4]: st.caption("Thr%")
+ROW_SPEC = [0.28, 2.2, 2.6, 1.0, 0.5]
 
-total_portfolios = len(st.session_state.portfolios_list)
-for i, port in enumerate(st.session_state.portfolios_list):
-    if 'id' not in port: port['id'] = str(uuid.uuid4())
+st.markdown('<div class="sec-label">Portfolios</div>', unsafe_allow_html=True)
+with st.container(border=True):
+    hdr = st.columns(ROW_SPEC, vertical_alignment="center")
+    for c, lbl in zip(hdr, ["", "Name", "Strategy", "Band %", ""]):
+        with c:
+            if lbl: st.markdown(f'<div class="col-cap">{lbl}</div>', unsafe_allow_html=True)
 
-    cols = st.columns([0.8, 3, 2, 2, 0.8, 0.4])
-    with cols[0]: st.markdown(f"**{port['name']}**")
-    with cols[1]: port['tickers'] = st.text_input(
-        "Tickers", port['tickers'], key=f"t_{port['id']}", label_visibility="collapsed",
-        help='Composite slot: wrap elements in parentheses, e.g. "QQQM, GLDM, (DBMF, KMLM)". '
-             "The slot takes ONE weight, split equally across its elements, and rebalances as one block.")
-    with cols[2]: port['weights'] = st.text_input("Weights", port['weights'], key=f"w_{port['id']}", label_visibility="collapsed")
-    with cols[3]: port['strat'] = st.selectbox("Strategy", strategy_options, index=strategy_options.index(port['strat']), key=f"s_{port['id']}", label_visibility="collapsed")
-    with cols[4]: port['thr'] = st.number_input("Thr%", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed")
-    with cols[5]:
-        if total_portfolios > 1:
-            st.button(":material/delete:", key=f"del_{port['id']}", on_click=delete_portfolio, args=(i,))
+    total_portfolios = len(st.session_state.portfolios_list)
+    for i, port in enumerate(st.session_state.portfolios_list):
+        if 'id' not in port: port['id'] = str(uuid.uuid4())
 
-btn_cols = st.columns([1, 1.5, 5.5])
-with btn_cols[0]:
-    if st.button(":material/add_circle: Add", width="stretch"):
-        existing_names = set(p["name"] for p in st.session_state.portfolios_list)
-        new_char_code = 65
-        while f"Port {chr(new_char_code)}" in existing_names: new_char_code += 1
-        last_port = st.session_state.portfolios_list[-1]
-        st.session_state.portfolios_list.append({
-            "id": str(uuid.uuid4()), "name": f"Port {chr(new_char_code)}",
-            "tickers": last_port["tickers"], "weights": last_port["weights"],
-            "strat": STRAT_RD_MIXED, "thr": 40
-        })
-        st.rerun()
-with btn_cols[1]:
-    run_clicked = st.button(":material/play_arrow: Analyze", type="primary", width="stretch")
-    if run_clicked:
-        error_msgs = validate_inputs(st.session_state.portfolios_list, bench_in)
-        if not error_msgs:
-            st.session_state.run_backtest = True
-        else:
-            st.session_state.run_backtest = False
-            for msg in error_msgs: st.error(msg)
+        cols = st.columns(ROW_SPEC, vertical_alignment="center")
+        with cols[0]: st.markdown(
+            f'<span class="row-dot" style="background:{SERIES_COLORS[i % len(SERIES_COLORS)]};'
+            f'color:{SERIES_COLORS[i % len(SERIES_COLORS)]}"></span>', unsafe_allow_html=True)
+        with cols[1]: port['name'] = st.text_input(
+            "Name", port['name'], key=f"n_{port['id']}", label_visibility="collapsed")
+        with cols[2]: port['strat'] = st.selectbox(
+            "Strategy", strategy_options, index=strategy_options.index(port['strat']),
+            key=f"s_{port['id']}", label_visibility="collapsed",
+            help="RelDiff Full = any breach resets all · Mixed = major (≥10%) breach resets all, "
+                 "else local · Local = only breached slots reset · Asymmetric = minors (<6%) "
+                 "trigger at 2.5×↑ / 1.25×↓ the band.")
+        with cols[3]: port['thr'] = st.number_input(
+            "Band %", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed",
+            help="Rebalance trigger band: relative deviation vs target weight, in %. "
+                 "E.g. 40 → a 10% slot triggers beyond 6%–14%.")
+        with cols[4]:
+            if total_portfolios > 1:
+                st.button(":material/delete:", key=f"del_{port['id']}",
+                          on_click=delete_portfolio, args=(i,), help="Remove this portfolio")
+
+    # --- Allocation matrix: one row per slot, one % column per portfolio ---
+    st.markdown(
+        '<div class="col-cap" style="margin-top:0.5rem">Allocation · weights in % · '
+        'blank or 0 = not held · wrap "(A, B)" for a composite slot · '
+        'add rows below for new assets</div>', unsafe_allow_html=True)
+
+    ports = st.session_state.portfolios_list
+    port_names = [p['name'] for p in ports]
+    if len(set(port_names)) != len(port_names):
+        st.error("Duplicate portfolio names — rename them above before editing allocations.")
+    else:
+        alloc_key = _alloc_struct_key(ports)
+        if st.session_state.get('_alloc_key') != alloc_key:
+            st.session_state['_alloc_key'] = alloc_key
+            base = build_alloc_df(ports)
+            # Assets added via search keep a pending row (no weight anywhere yet)
+            # until the user fills a weight; then they live in the strings and
+            # the pending entry is pruned.
+            existing = set(str(a).strip() for a in base["Asset"])
+            pending = [t for t in st.session_state.get('_alloc_pending', []) if t not in existing]
+            st.session_state['_alloc_pending'] = pending
+            if pending:
+                pad = pd.DataFrame({"Asset": pending,
+                                    **{p['name']: [None] * len(pending) for p in ports}})
+                base = pd.concat([base, pad], ignore_index=True)
+            st.session_state['_alloc_base'] = base
+
+        # Typeahead add-asset search (Yahoo symbol search, like Portfolio
+        # Visualizer's ticker box). Optional: without the package the matrix
+        # still accepts hand-typed tickers in new rows.
+        if HAS_SEARCHBOX:
+            sb_cols = st.columns([2.8, 4.2])
+            with sb_cols[0]:
+                picked = st_searchbox(
+                    yahoo_symbol_search, key="asset_search",
+                    placeholder="Add asset — search ticker or fund name…",
+                    clear_on_submit=True, debounce=250)
+            if picked:
+                tok = clean_ticker(str(picked))
+                rows_now = set(str(a).strip() for a in st.session_state['_alloc_base']["Asset"])
+                pend = st.session_state.setdefault('_alloc_pending', [])
+                if tok not in rows_now and tok not in pend:
+                    pend.append(tok)
+                    st.session_state['_alloc_nonce'] = st.session_state.get('_alloc_nonce', 0) + 1
+                    st.rerun()
+
+        col_cfg = {"Asset": st.column_config.TextColumn(
+            "Asset", width="medium",
+            help='Ticker (e.g. QQQM, 0700.HK) or a composite slot "(DBMF, KMLM)": '
+                 'one weight, split equally inside, rebalanced as one block.')}
+        for p in ports:
+            col_cfg[p['name']] = st.column_config.NumberColumn(
+                p['name'], min_value=0.0, max_value=100.0, step=0.5, format="%.2f%%",
+                help=f"Target weight of each asset in {p['name']}, in percent.")
+
+        edited_alloc = st.data_editor(
+            st.session_state['_alloc_base'], key=alloc_key, num_rows="dynamic",
+            column_config=col_cfg, hide_index=True, width="stretch")
+        sync_alloc(edited_alloc, ports)
+
+        sums = []
+        for p in ports:
+            total = float(pd.to_numeric(edited_alloc[p['name']], errors='coerce').fillna(0).sum())
+            ok = abs(total - 100) < 0.01
+            color, mark = ('var(--good)', '✓') if ok else ('var(--bad)', '≠ 100%')
+            sums.append(f'<span style="color:{color};font-weight:600">{p["name"]}: {total:.4g}% {mark}</span>')
+        st.markdown('<div class="alloc-sums">' + ' &nbsp;·&nbsp; '.join(sums) + '</div>',
+                    unsafe_allow_html=True)
+
+    btn_cols = st.columns([1.4, 2, 4.6])
+    with btn_cols[0]:
+        if st.button(":material/add_circle: Add", width="stretch"):
+            existing_names = set(p["name"] for p in st.session_state.portfolios_list)
+            new_char_code = 65
+            while f"Port {chr(new_char_code)}" in existing_names: new_char_code += 1
+            last_port = st.session_state.portfolios_list[-1]
+            st.session_state.portfolios_list.append({
+                "id": str(uuid.uuid4()), "name": f"Port {chr(new_char_code)}",
+                "tickers": last_port["tickers"], "weights": last_port["weights"],
+                "strat": STRAT_RD_MIXED, "thr": 40
+            })
+            st.rerun()
+    with btn_cols[1]:
+        run_clicked = st.button(":material/play_arrow: Analyze", type="primary", width="stretch")
+        if run_clicked:
+            error_msgs = validate_inputs(st.session_state.portfolios_list, bench_in)
+            if not error_msgs:
+                st.session_state.run_backtest = True
+            else:
+                st.session_state.run_backtest = False
+                for msg in error_msgs: st.error(msg)
 
 st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
@@ -814,15 +1033,19 @@ if st.session_state.run_backtest:
             m["name"] = p_name
             metrics.append(m)
 
-        # --- KPI Cards (kpi-dashboard-design: Executive Summary pattern) ---
-        for i_m, m in enumerate(metrics):
-            render_kpi_cards(m["name"], m, is_bench=(i_m == 0))
+        # --- Identity colors: keyed to editor ROW INDEX so a series keeps its
+        # color across charts, cards and tables even if another one is dropped.
+        color_map = {f"Benchmark({bench_in})": BENCH_COLOR}
+        for i_p, p in enumerate(st.session_state.portfolios_list):
+            color_map.setdefault(p['name'], SERIES_COLORS[i_p % len(SERIES_COLORS)])
+
+        # --- Summary cards (one per series) ---
+        render_summary_cards(metrics, color_map)
 
         # --- Comparison Table ---
         if len(metrics) >= 2:
-            st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
             with st.expander("Performance Comparison", expanded=True):
-                render_comparison_table(metrics)
+                render_comparison_table(metrics, color_map)
 
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
@@ -832,21 +1055,28 @@ if st.session_state.run_backtest:
         x_axis_format = '%Y-%m-%d' if days_span < 90 else '%Y-%m'
         label_angle = -45 if days_span < 90 else 0
 
-        # Color palette
-        palette = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4']
+        # Series color scale: identity colors, benchmark drawn as a dashed
+        # neutral context line (secondary encoding on top of the gray hue).
+        bench_col = f"Benchmark({bench_in})"
+        series_domain = list(chart_df.columns)
+        series_range = [color_map.get(c, BENCH_COLOR) for c in series_domain]
+        series_scale = alt.Scale(domain=series_domain, range=series_range)
+        bench_dash = alt.condition(alt.datum.Portfolio == bench_col,
+                                   alt.value([5, 4]), alt.value([1, 0]))
 
         chart_data = chart_df.reset_index().melt('Date', var_name='Portfolio', value_name='Return')
         rule_data = chart_df.reset_index()
         nearest = alt.selection_point(nearest=True, on='mouseover', fields=['Date'], empty=False)
 
-        line = alt.Chart(chart_data).mark_line(strokeWidth=2.5).encode(
+        line = alt.Chart(chart_data).mark_line(strokeWidth=2).encode(
             x=alt.X('Date:T', axis=alt.Axis(format=x_axis_format, title=None, labelAngle=label_angle, grid=False)),
-            y=alt.Y('Return:Q', axis=alt.Axis(format='.1%', title='Cumulative Return' + (' (CPI adj.)' if inf_adj else ''), grid=True, gridDash=[3,3], gridColor='#e5e7eb')),
-            color=alt.Color('Portfolio:N', legend=alt.Legend(orient='top', title=None, labelFontSize=12), scale=alt.Scale(range=palette))
+            y=alt.Y('Return:Q', axis=alt.Axis(format='.1%', title='Cumulative Return' + (' (CPI adj.)' if inf_adj else ''), grid=True, gridDash=[3,3], gridColor=_T["grid"])),
+            color=alt.Color('Portfolio:N', legend=alt.Legend(orient='top', title=None, labelFontSize=12), scale=series_scale),
+            strokeDash=bench_dash
         )
 
         # Zero baseline
-        zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color='#94a3b8', strokeDash=[4,4], strokeWidth=1).encode(y='y:Q')
+        zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color=_T["muted"], strokeDash=[4,4], strokeWidth=1).encode(y='y:Q')
 
         tooltips = [alt.Tooltip('Date:T', format='%Y-%m-%d', title='Date')]
         for col in chart_df.columns:
@@ -856,7 +1086,7 @@ if st.session_state.run_backtest:
             x='Date:T', tooltip=tooltips
         ).add_params(nearest)
 
-        rules = alt.Chart(rule_data).mark_rule(color='#94a3b8', strokeDash=[3,3]).encode(
+        rules = alt.Chart(rule_data).mark_rule(color=_T["muted"], strokeDash=[3,3]).encode(
             x='Date:T', tooltip=tooltips
         ).transform_filter(nearest)
 
@@ -881,8 +1111,9 @@ if st.session_state.run_backtest:
 
             dd_line = alt.Chart(dd_long).mark_line(strokeWidth=2).encode(
                 x=alt.X('Date:T', axis=alt.Axis(format=x_axis_format, title=None, labelAngle=label_angle, grid=False)),
-                y=alt.Y('Drawdown:Q', axis=alt.Axis(format='.0%', title='Drawdown', grid=True, gridDash=[3,3], gridColor='#e5e7eb')),
-                color=alt.Color('Portfolio:N', legend=alt.Legend(orient='top', title=None, labelFontSize=12), scale=alt.Scale(range=palette))
+                y=alt.Y('Drawdown:Q', axis=alt.Axis(format='.0%', title='Drawdown', grid=True, gridDash=[3,3], gridColor=_T["grid"])),
+                color=alt.Color('Portfolio:N', legend=alt.Legend(orient='top', title=None, labelFontSize=12), scale=series_scale),
+                strokeDash=bench_dash
             )
             dd_tooltips = [alt.Tooltip('Date:T', format='%Y-%m-%d', title='Date')]
             for col in dd_df.columns:
@@ -890,7 +1121,7 @@ if st.session_state.run_backtest:
             dd_selectors = alt.Chart(dd_wide).mark_rule(opacity=0.001, strokeWidth=40).encode(
                 x='Date:T', tooltip=dd_tooltips
             ).add_params(dd_nearest)
-            dd_rules = alt.Chart(dd_wide).mark_rule(color='#94a3b8', strokeDash=[3,3]).encode(
+            dd_rules = alt.Chart(dd_wide).mark_rule(color=_T["muted"], strokeDash=[3,3]).encode(
                 x='Date:T', tooltip=dd_tooltips
             ).transform_filter(dd_nearest)
             dd_points = dd_line.mark_point(size=60, filled=True).encode(
@@ -915,10 +1146,11 @@ if st.session_state.run_backtest:
             tab_names = list(res_list.keys())
             tabs = st.tabs(tab_names)
             def style_row(row):
+                # Explicit dark ink on the pastel fills so rows stay readable in dark theme
                 if row['Type'] == 'PnL Contrib%': return ['background-color: #fce4ec; color: #d81b60; font-weight: bold'] * len(row)
-                if row['Type'] == 'Init': return ['background-color: #e3f2fd; font-weight: bold'] * len(row)
-                if row['Type'] == 'Pre-Rebal': return ['background-color: #fff3e0'] * len(row)
-                if row['Type'] == 'Post-Rebal': return ['background-color: #e8f5e9'] * len(row)
+                if row['Type'] == 'Init': return ['background-color: #e3f2fd; color: #1a1a2e; font-weight: bold'] * len(row)
+                if row['Type'] == 'Pre-Rebal': return ['background-color: #fff3e0; color: #1a1a2e'] * len(row)
+                if row['Type'] == 'Post-Rebal': return ['background-color: #e8f5e9; color: #1a1a2e'] * len(row)
                 return [''] * len(row)
             for tab, lbl in zip(tabs, tab_names):
                 with tab:
@@ -928,4 +1160,14 @@ if st.session_state.run_backtest:
         # --- Annual Returns by Calendar Year ---
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
         with st.expander("Annual Returns by Calendar Year", expanded=True):
-            render_annual_returns_table(comp_df, metrics)
+            render_annual_returns_table(comp_df, metrics, color_map)
+else:
+    st.markdown("""
+    <div class="empty-state">
+        <div class="es-icon">📊</div>
+        <div class="es-title">Ready when you are</div>
+        <div class="es-body">Configure the portfolios above — or load a saved config from the
+        sidebar — then hit <b>Analyze</b>. Prices come from Yahoo Finance with dividends
+        reinvested; windows ≥ 90 days are sampled at month-end by design.</div>
+    </div>
+    """, unsafe_allow_html=True)
