@@ -189,6 +189,42 @@ class SearchboxPickLifecycleTest(unittest.TestCase):
                              for a in at.session_state["_alloc_base"]["Asset"]))
 
 
+class EditorStateWipeTest(unittest.TestCase):
+    """The engine drops the editor's accumulated diffs on any run that ends
+    before instantiating it — st_searchbox fires one such internal rerun per
+    search keystroke. The editor then re-anchors on the stale base with empty
+    diffs, and sync must NOT write the old values back over the strings."""
+
+    def test_wiped_editor_state_does_not_revert_strings(self):
+        at = AppTest.from_file(APP, default_timeout=120).run()
+
+        # Committed edit: delta in widget state, editor renders, sync ran.
+        alloc_key = at.session_state["_alloc_key"]
+        base = at.session_state["_alloc_base"]
+        row = next(i for i, a in enumerate(base["Asset"]) if str(a).strip() == "QQQM")
+        at.session_state[alloc_key] = {
+            "edited_rows": {str(row): {"AV-US": 20.0}},
+            "added_rows": [], "deleted_rows": [],
+        }
+        at.run()
+        self.assertTrue(_port(at, "AV-US")["weights"].startswith("0.2"))
+
+        # Engine wipe: diffs cleared, key unchanged, base snapshot stale.
+        at.session_state[alloc_key] = {
+            "edited_rows": {}, "added_rows": [], "deleted_rows": [],
+        }
+        at.run()
+        self.assertFalse(at.exception)
+
+        weights = _port(at, "AV-US")["weights"]
+        self.assertTrue(weights.startswith("0.2"),
+                        f"wiped editor state reverted the strings: {weights}")
+        # And the rebuilt base must show the true (string) values.
+        base2 = at.session_state["_alloc_base"]
+        row2 = next(i for i, a in enumerate(base2["Asset"]) if str(a).strip() == "QQQM")
+        self.assertEqual(float(base2.loc[row2, "AV-US"]), 20.0)
+
+
 class SaveDefaultValidationTest(unittest.TestCase):
     def test_invalid_config_not_saved(self):
         default_path = APP_DIR / "Backtest" / "_default.json"

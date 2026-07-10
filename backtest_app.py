@@ -28,7 +28,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.3.4"  # semver: major.minor.patch
+APP_VERSION = "2.3.5"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
@@ -662,6 +662,11 @@ def flush_alloc_edits():
     state = st.session_state.get(key) if key else None
     if base is None or not isinstance(state, dict):
         return None
+    if not any(state.get(k) for k in ("edited_rows", "added_rows", "deleted_rows")):
+        # No diffs in flight. NEVER sync in this situation: if the engine just
+        # wiped the editor's state (early rerun above it), base is stale and
+        # syncing would overwrite the strings with old values.
+        return None
     try:
         merged = _merge_editor_state(base, state)
         sync_alloc(merged, st.session_state.portfolios_list)
@@ -1016,23 +1021,14 @@ with st.container(border=True):
                        "blank weight below and drop from the stored config when the matrix "
                        "syncs — fill their weights now or re-import a corrected JSON.")
 
-        alloc_key = _alloc_struct_key(ports)
-        if st.session_state.get('_alloc_key') != alloc_key:
-            # The key changed this run (port added/deleted/renamed or searchbox
-            # add): fold the outgoing editor's in-flight edits into the strings
-            # FIRST, or edits delivered in this same browser event are lost.
-            flush_alloc_edits()
-            st.session_state['_alloc_key'] = alloc_key
+        def _build_alloc_base():
+            """Fresh editor base from the stored strings: union of slots, plus
+            pending (searchbox-added, not yet weighted) rows, CN labels last.
+            Pending rows the user weighted (now in the strings) leave the
+            list; deleted-row pruning happens inside flush_alloc_edits while
+            the editor state is still alive."""
             base = build_alloc_df(ports)
-            # Assets added via search keep a pending row (no weight anywhere yet)
-            # until the user fills a weight; then they live in the strings and
-            # the pending entry is pruned. A pending row the user deleted in the
-            # editor (absent from the merged frame) is dropped for good instead
-            # of resurrecting on every rebuild.
             existing = set(str(a).strip() for a in base["Asset"])
-            # Deleted-row pruning already happened inside flush_alloc_edits
-            # (while the editor state was still alive); here only tokens that
-            # gained a weight (now in the strings) leave the pending list.
             pending = [t for t in st.session_state.get('_alloc_pending', [])
                        if t not in existing]
             st.session_state['_alloc_pending'] = pending
@@ -1042,12 +1038,38 @@ with st.container(border=True):
                                     **{p['name']: [None] * len(pending) for p in ports}})
                 base = pd.concat([base, pad], ignore_index=True)
             base["Asset"] = label_alloc_assets(base["Asset"])
-            st.session_state['_alloc_base'] = base
+            return base
+
+        alloc_key = _alloc_struct_key(ports)
+        if st.session_state.get('_alloc_key') != alloc_key:
+            # The key changed this run (port added/deleted/renamed or searchbox
+            # add): fold the outgoing editor's in-flight edits into the strings
+            # FIRST, or edits delivered in this same browser event are lost.
+            flush_alloc_edits()
+            st.session_state['_alloc_key'] = alloc_key
+            st.session_state['_alloc_base'] = _build_alloc_base()
+        else:
+            # Same key. The engine DROPS the editor's accumulated diffs on any
+            # run that ends before instantiating it — st_searchbox fires an
+            # internal rerun per search keystroke, above the editor. With the
+            # diffs gone the editor would re-anchor on this stale base and
+            # sync_alloc would write the OLD values back over the strings.
+            # Whenever no diffs are in flight, re-derive the base from the
+            # strings instead of trusting the snapshot (idempotent when
+            # nothing changed).
+            _ed_state = st.session_state.get(alloc_key)
+            _has_diffs = isinstance(_ed_state, dict) and any(
+                _ed_state.get(k) for k in ("edited_rows", "added_rows", "deleted_rows"))
+            if not _has_diffs:
+                st.session_state['_alloc_base'] = _build_alloc_base()
 
         # Typeahead add-asset search (Yahoo symbol search, like Portfolio
         # Visualizer's ticker box). Optional: without the package the matrix
         # still accepts hand-typed tickers in new rows.
         if HAS_SEARCHBOX:
+            # Capture any in-flight edits BEFORE the component runs: its
+            # per-keystroke internal rerun would otherwise drop them unseen.
+            flush_alloc_edits()
             sb_cols = st.columns([2.8, 4.2])
             with sb_cols[0]:
                 picked = st_searchbox(
