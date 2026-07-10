@@ -1,6 +1,7 @@
-# Pinned to the locally verified stack (2026-07-10). Streamlit Cloud installs
-# whatever resolves at deploy time; open ranges previously pulled pandas 3.x /
-# yfinance 1.5.x — a dependency matrix the app was never tested on.
+# Pinned to the locally verified stack (2026-07-10). Cloud deploy segfaulted
+# (run-streamlit.sh: Segmentation fault) with the unpinned resolution — pin
+# every native-code dependency, not just the direct imports. pyarrow is the
+# data_editor serializer: the crashes fire exactly on matrix rebuilds.
 streamlit==1.54.0
 requests==2.32.5
 yfinance==1.1.0
@@ -8,3 +9,11 @@ pandas==2.3.3
 numpy==2.4.2
 altair==6.0.0
 streamlit-searchbox==0.1.24
+
+# Native-code transitive deps (verified locally)
+pyarrow==23.0.0
+protobuf==6.33.5
+pillow==12.1.0
+curl_cffi==0.13.0
+lxml==6.0.2
+tornado==6.5.4

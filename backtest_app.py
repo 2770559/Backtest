@@ -28,7 +28,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.3.2"  # semver: major.minor.patch
+APP_VERSION = "2.3.3"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
