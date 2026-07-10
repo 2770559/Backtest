@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 .claude/
+nohup.out
+
+# Personal / local-only — never publish
+Backtest/_default.json
+Backtest/AV-CN.json
+AV-CN_study_2026-07.md

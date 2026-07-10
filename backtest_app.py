@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import altair as alt
 import requests
+import re
 import uuid
 import json
 from datetime import datetime, timedelta
@@ -26,8 +27,8 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.1.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-07-08"
+APP_VERSION = "2.3.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -308,6 +309,42 @@ if 'bi' not in st.session_state: st.session_state['bi'] = "SPY"
 if 'sd' not in st.session_state: st.session_state['sd'] = datetime(2020, 1, 1)
 if 'init_funds' not in st.session_state: st.session_state['init_funds'] = 10000
 
+# --- Config persistence (sidebar Config I/O + Save Default button) ---
+SAVED_CONFIG_DIR = Path(__file__).parent / "Backtest"
+DEFAULT_CONFIG_PATH = SAVED_CONFIG_DIR / "_default.json"
+VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL,
+                STRAT_ASYM}
+
+def _apply_config_state(loaded_config):
+    """Normalize a config dict into session state (no rerun)."""
+    st.session_state.portfolios_list = loaded_config.get("portfolios", [])
+    for p in st.session_state.portfolios_list:
+        if 'id' not in p: p['id'] = str(uuid.uuid4())
+        p.setdefault('name', 'Port ?')
+        p.setdefault('tickers', '')
+        p.setdefault('weights', '')
+        p.setdefault('thr', 38)
+        if p.get('strat') in STRAT_LEGACY_MAP:
+            p['strat'] = STRAT_LEGACY_MAP[p['strat']]
+        if p.get('strat') not in VALID_STRATS:
+            p['strat'] = STRAT_ASYM
+    st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
+    st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
+    st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
+    st.session_state.run_backtest = False
+
+if 'portfolios_list' not in st.session_state:
+    # New session: a saved default (Save Default button) replaces the built-in
+    # config below. Delete Backtest/_default.json to restore the built-ins.
+    _default_cfg = None
+    if DEFAULT_CONFIG_PATH.is_file():
+        try:
+            _default_cfg = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _default_cfg = None
+    if _default_cfg and _default_cfg.get("portfolios"):
+        _apply_config_state(_default_cfg)
+
 if 'portfolios_list' not in st.session_state:
     st.session_state.portfolios_list = [
         {
@@ -343,6 +380,31 @@ if 'portfolios_list' not in st.session_state:
 def delete_portfolio(idx):
     if 0 <= idx < len(st.session_state.portfolios_list):
         st.session_state.portfolios_list.pop(idx)
+
+def _n_to_letters(n):
+    """1 -> A ... 26 -> Z, 27 -> AA (spreadsheet-column order)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def next_port_name(ports):
+    """Continue the letter sequence after the highest existing "Port X"
+    (last is Port C -> Port D); custom names like AV-US are ignored."""
+    existing = {str(p.get("name", "")).strip() for p in ports}
+    last = 0
+    for name in existing:
+        m = re.fullmatch(r"(?i)port\s+([a-z]+)", name)
+        if m:
+            n = 0
+            for ch in m.group(1).upper():
+                n = n * 26 + ord(ch) - 64
+            last = max(last, n)
+    n = last + 1
+    while f"Port {_n_to_letters(n)}" in existing:
+        n += 1
+    return f"Port {_n_to_letters(n)}"
 
 # --- 2. Data Fetch & Validation Helpers ---
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -408,7 +470,7 @@ def sync_alloc(df, ports):
             continue
         tks, wts = [], []
         for _, row in df.iterrows():
-            tok = str(row["Asset"] if pd.notna(row["Asset"]) else "").strip()
+            tok = _strip_asset_label(row["Asset"] if pd.notna(row["Asset"]) else "")
             w = row[p["name"]]
             if not tok or pd.isna(w) or w == 0:
                 continue
@@ -424,6 +486,81 @@ def _alloc_struct_key(ports):
     editor's edit-state on a freshly built base DataFrame."""
     nonce = st.session_state.get("_alloc_nonce", 0)
     return f"alloc_{abs(hash(tuple((p['id'], p['name']) for p in ports)))}_{nonce}"
+
+
+# --- Asset display names (CN-listed ETFs/stocks) ---------------------------
+# The matrix's Asset column shows CN-listed codes with their exchange Chinese
+# short name ("511010.SS - 国债ETF国泰"). Live names come from Tencent's batch
+# quote endpoint; CN_NAME_SEED keeps the common set labeled when offline.
+# Display-layer only: the stored tickers/weights strings, JSON export/import
+# and the engine always carry bare codes (sync_alloc strips the label).
+CN_NAME_SEED = {
+    "159915.SZ": "创业板ETF易方达", "159941.SZ": "纳指ETF广发", "159985.SZ": "豆粕ETF华夏",
+    "510300.SS": "沪深300ETF华泰柏瑞", "511010.SS": "国债ETF国泰", "511130.SS": "30年国债ETF博时",
+    "512400.SS": "有色金属ETF南方", "512890.SS": "红利低波ETF华泰柏瑞", "513500.SS": "标普500ETF博时",
+    "515220.SS": "煤炭ETF国泰", "518880.SS": "黄金ETF华安", "588080.SS": "科创50ETF易方达",
+}
+NAME_SEP = " - "
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_cn_names(symbols):
+    """Batch-resolve .SS/.SZ tickers to Chinese short names via Tencent's
+    quote API (GBK payload, no auth). Failures fall back to CN_NAME_SEED;
+    tickers absent from the result simply display as the bare code."""
+    codes = {}
+    for tk in symbols:
+        tk = str(tk).strip().upper()
+        if tk.endswith(".SS") and tk[:-3].isdigit():
+            codes["sh" + tk[:-3]] = tk
+        elif tk.endswith(".SZ") and tk[:-3].isdigit():
+            codes["sz" + tk[:-3]] = tk
+    out = dict(CN_NAME_SEED)
+    if not codes:
+        return out
+    try:
+        r = requests.get("https://qt.gtimg.cn/q=" + ",".join(codes),
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+        payload = r.content.decode("gbk", errors="replace")
+        for m in re.finditer(r'v_(s[hz]\d+)="([^"]*)"', payload):
+            parts = m.group(2).split("~")
+            if len(parts) > 2 and parts[1] and m.group(1) in codes:
+                out[codes[m.group(1)]] = parts[1]
+    except Exception:
+        pass
+    return out
+
+
+def _label_asset(tok, names):
+    """Slot token -> display label; composite members are labeled individually."""
+    tok = str(tok).strip()
+    if tok.startswith("(") and tok.endswith(")"):
+        inner = [_label_asset(m, names) for m in tok[1:-1].split(",") if m.strip()]
+        return "(" + ", ".join(inner) + ")"
+    name = names.get(clean_ticker(tok)) if tok else None
+    return f"{tok}{NAME_SEP}{name}" if name else tok
+
+
+def _strip_asset_label(label):
+    """Inverse of _label_asset: drop the display name, keep the raw token."""
+    s = str(label or "").strip()
+    if s.startswith("(") and s.endswith(")"):
+        inner = [_strip_asset_label(m) for m in s[1:-1].split(",")]
+        return "(" + ", ".join(t for t in inner if t) + ")"
+    return s.split(NAME_SEP)[0].strip()
+
+
+def label_alloc_assets(assets):
+    """Label a whole Asset column with one batched name fetch for CN tickers."""
+    toks = [str(a).strip() for a in assets]
+    cn = sorted({clean_ticker(m)
+                 for t in toks
+                 for m in (t[1:-1].split(",") if t.startswith("(") and t.endswith(")") else [t])
+                 if m.strip() and clean_ticker(m).endswith((".SS", ".SZ"))})
+    if not cn:
+        return toks
+    names = fetch_cn_names(tuple(cn))
+    return [_label_asset(t, names) for t in toks]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -590,27 +727,9 @@ def render_annual_returns_table(comp_df, metrics, color_map):
 
 
 # --- 3. Sidebar: Global Settings ---
-SAVED_CONFIG_DIR = Path(__file__).parent / "Backtest"
-VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL,
-                STRAT_ASYM}
-
 def apply_config(loaded_config):
     """Apply an imported/saved config dict to session state and rerun."""
-    st.session_state.portfolios_list = loaded_config.get("portfolios", [])
-    for p in st.session_state.portfolios_list:
-        if 'id' not in p: p['id'] = str(uuid.uuid4())
-        p.setdefault('name', 'Port ?')
-        p.setdefault('tickers', '')
-        p.setdefault('weights', '')
-        p.setdefault('thr', 38)
-        if p.get('strat') in STRAT_LEGACY_MAP:
-            p['strat'] = STRAT_LEGACY_MAP[p['strat']]
-        if p.get('strat') not in VALID_STRATS:
-            p['strat'] = STRAT_ASYM
-    st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
-    st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
-    st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
-    st.session_state.run_backtest = False  # require explicit Analyze on new config
+    _apply_config_state(loaded_config)  # leaves run_backtest False: explicit Analyze required
     st.rerun()
 
 with st.sidebar:
@@ -705,6 +824,36 @@ with st.container(border=True):
                 st.button(":material/delete:", key=f"del_{port['id']}",
                           on_click=delete_portfolio, args=(i,), help="Remove this portfolio")
 
+    # --- Actions: add portfolio / persist current setup as startup default ---
+    act_cols = st.columns([1.4, 2.2, 4.4])
+    with act_cols[0]:
+        if st.button(":material/add_circle: Add", width="stretch",
+                     help="Add a portfolio (copies the last one's allocation)."):
+            last_port = st.session_state.portfolios_list[-1]
+            st.session_state.portfolios_list.append({
+                "id": str(uuid.uuid4()),
+                "name": next_port_name(st.session_state.portfolios_list),
+                "tickers": last_port["tickers"], "weights": last_port["weights"],
+                "strat": STRAT_RD_MIXED, "thr": 40
+            })
+            st.rerun()
+    with act_cols[1]:
+        if st.button(":material/bookmark_add: Save Default", width="stretch",
+                     help="Save the current setup (portfolios, benchmark, start date, initial "
+                          "funds) as the startup default — new sessions open with it. Delete "
+                          "Backtest/_default.json to restore the built-in config."):
+            try:
+                SAVED_CONFIG_DIR.mkdir(exist_ok=True)
+                DEFAULT_CONFIG_PATH.write_text(json.dumps({
+                    "benchmark": st.session_state['bi'],
+                    "start_date": str(st.session_state['sd']),
+                    "initial_funds": st.session_state['init_funds'],
+                    "portfolios": st.session_state.portfolios_list,
+                }, indent=2, ensure_ascii=False), encoding="utf-8")
+                st.toast("Saved — new sessions now open with this setup", icon="✅")
+            except Exception as e:
+                st.error(f"Save default failed: {e}")
+
     # --- Allocation matrix: one row per slot, one % column per portfolio ---
     st.markdown(
         '<div class="col-cap" style="margin-top:0.5rem">Allocation · weights in % · '
@@ -730,6 +879,7 @@ with st.container(border=True):
                 pad = pd.DataFrame({"Asset": pending,
                                     **{p['name']: [None] * len(pending) for p in ports}})
                 base = pd.concat([base, pad], ignore_index=True)
+            base["Asset"] = label_alloc_assets(base["Asset"])
             st.session_state['_alloc_base'] = base
 
         # Typeahead add-asset search (Yahoo symbol search, like Portfolio
@@ -744,7 +894,7 @@ with st.container(border=True):
                     clear_on_submit=True, debounce=250)
             if picked:
                 tok = clean_ticker(str(picked))
-                rows_now = set(str(a).strip() for a in st.session_state['_alloc_base']["Asset"])
+                rows_now = set(_strip_asset_label(a) for a in st.session_state['_alloc_base']["Asset"])
                 pend = st.session_state.setdefault('_alloc_pending', [])
                 if tok not in rows_now and tok not in pend:
                     pend.append(tok)
@@ -754,7 +904,9 @@ with st.container(border=True):
         col_cfg = {"Asset": st.column_config.TextColumn(
             "Asset", width="medium",
             help='Ticker (e.g. QQQM, 0700.HK) or a composite slot "(DBMF, KMLM)": '
-                 'one weight, split equally inside, rebalanced as one block.')}
+                 'one weight, split equally inside, rebalanced as one block. '
+                 'CN-listed codes (.SS/.SZ) show their Chinese short name after the '
+                 'code — type just the code when adding; the label is display-only.')}
         for p in ports:
             col_cfg[p['name']] = st.column_config.NumberColumn(
                 p['name'], min_value=0.0, max_value=100.0, step=0.5, format="%.2f%%",
@@ -774,20 +926,8 @@ with st.container(border=True):
         st.markdown('<div class="alloc-sums">' + ' &nbsp;·&nbsp; '.join(sums) + '</div>',
                     unsafe_allow_html=True)
 
-    btn_cols = st.columns([1.4, 2, 4.6])
+    btn_cols = st.columns([2, 6])
     with btn_cols[0]:
-        if st.button(":material/add_circle: Add", width="stretch"):
-            existing_names = set(p["name"] for p in st.session_state.portfolios_list)
-            new_char_code = 65
-            while f"Port {chr(new_char_code)}" in existing_names: new_char_code += 1
-            last_port = st.session_state.portfolios_list[-1]
-            st.session_state.portfolios_list.append({
-                "id": str(uuid.uuid4()), "name": f"Port {chr(new_char_code)}",
-                "tickers": last_port["tickers"], "weights": last_port["weights"],
-                "strat": STRAT_RD_MIXED, "thr": 40
-            })
-            st.rerun()
-    with btn_cols[1]:
         run_clicked = st.button(":material/play_arrow: Analyze", type="primary", width="stretch")
         if run_clicked:
             error_msgs = validate_inputs(st.session_state.portfolios_list, bench_in)
