@@ -17,6 +17,7 @@ python3 -m unittest discover -s tests          # 单元测试
 - **分配矩阵编辑器（v2.1.0，Portfolio Visualizer 式）**：一行一个标的槽位、每组合一列权重（%），空白/0 = 不持有；列合计实时校验；矩阵上方 Yahoo 联想搜索框输入即联想、选中自动加行（可选依赖 `streamlit-searchbox`，缺失时可手动在表尾加行）。底层存储仍为 tickers/weights 字符串，JSON 导入导出与旧配置完全兼容
 - **境内标的中文名显示（v2.2.0）**：Asset 列对 `.SS`/`.SZ` 代码显示「代码 - 交易所中文简称」（如 `511010.SS - 国债ETF国泰`），名称经腾讯行情接口批量解析并缓存 24 小时，离线回退内置种子表；仅显示层生效，存储/导出/引擎始终使用裸代码。新增 Port 命名接续现存最大 `Port X` 序号（Port C → Port D，Z 后进位 AA）
 - **Save Default 启动默认配置（v2.3.0）**：Add 与 Save Default 按钮移至分配矩阵上方；Save Default 将当前完整配置（组合/基准/起始日/本金）写入 `Backtest/_default.json`，新会话启动时自动加载，无需改代码即可自定义默认组合；删除该文件恢复内置默认
+- **状态机与管线修复（v2.3.4）**：在途编辑冲洗（改比例与加组合/加标的/删组合同一事件到达时不再被回滚，`flush_alloc_edits`）；载入配置丢弃陈旧编辑态；侧栏 Export 改为本轮末渲染（导出不再滞后一轮）；空组合/全无数据/归一化除零/保留名（Date/Return/Drawdown/Benchmark(x)）等崩溃路径全部加闸；CPI 年界差一天修正、Year 列锁定；FRED/Yahoo 拉取失败不再被缓存整个 TTL；新增 tests/test_app_state.py 状态机回归
 - **主题感知 UI（v2.1.0）**：亮/暗模式各有一套设计令牌；系列身份色贯穿配置行、摘要卡、图表与表头（色盲安全校验），基准为灰色虚线
 - 数据源 yfinance（复权价，含分红再投资），下载结果缓存 1 小时
 - 配置可导出/导入 JSON；`Backtest/` 目录下的已存配置可在侧边栏直接下拉加载

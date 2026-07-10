@@ -28,7 +28,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.3.3"  # semver: major.minor.patch
+APP_VERSION = "2.3.4"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
@@ -333,6 +333,17 @@ def _apply_config_state(loaded_config):
     st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
     st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
     st.session_state.run_backtest = False
+    # Discard allocation-editor scaffolding: stale in-flight edits must not be
+    # flushed over a freshly loaded config on the next matrix rebuild.
+    _old_key = st.session_state.pop('_alloc_key', None)
+    if _old_key:
+        st.session_state.pop(_old_key, None)
+    st.session_state.pop('_alloc_base', None)
+    st.session_state.pop('_alloc_pending', None)
+    st.session_state.pop('_alloc_pending_seen', None)
+    _sb_state = st.session_state.get("asset_search")
+    if isinstance(_sb_state, dict):  # a stale searchbox pick must not leak in
+        _sb_state["result"] = None
 
 if 'portfolios_list' not in st.session_state:
     # New session: a saved default (Save Default button) replaces the built-in
@@ -412,20 +423,37 @@ def next_port_name(ports):
 def fetch_price_history(tickers, start):
     """Cached wrapper around yf.download so widget interactions don't re-hit Yahoo.
     max_entries bounds memory on small cloud containers: every distinct ticker
-    set caches its own download for the TTL."""
-    return yf.download(list(tickers), start=start, progress=False)
+    set caches its own download for the TTL. Raises on an empty result so a
+    transient Yahoo failure is NOT cached for the full TTL (exceptions bypass
+    st.cache_data); the caller already handles download exceptions."""
+    df = yf.download(list(tickers), start=start, progress=False)
+    if df is None or df.empty:
+        raise RuntimeError("Yahoo returned no data (transient failure or rate limit)")
+    return df
+
+# Series names that collide with chart/table plumbing (index/melt names) or
+# the allocation matrix's token column ("Asset").
+RESERVED_SERIES_NAMES = {"Date", "Return", "Drawdown", "Portfolio", "Asset"}
 
 def validate_inputs(portfolios, benchmark):
     """Validate benchmark + all portfolio configs. Returns list of error messages."""
     errors = []
     if not str(benchmark).strip():
         errors.append("Benchmark ticker is empty")
+    if not portfolios:
+        errors.append("No portfolios configured — add one first")
     names = [p['name'] for p in portfolios]
     if any(not str(n).strip() for n in names):
         errors.append("Portfolio name is empty")
     dup_names = sorted({n for n in names if names.count(n) > 1})
     if dup_names:
         errors.append("Duplicate portfolio names: " + ", ".join(dup_names))
+    reserved = sorted({str(n).strip() for n in names} & RESERVED_SERIES_NAMES)
+    if reserved:
+        errors.append("Reserved name(s) not allowed for portfolios: " + ", ".join(reserved))
+    bench_label = f"Benchmark({benchmark})"
+    if bench_label in names:
+        errors.append(f'Portfolio name "{bench_label}" collides with the benchmark series')
     for p in portfolios:
         _, _, perrs, _ = parse_portfolio(p)
         errors.extend(f"**{p['name']}**: {e}" for e in perrs)
@@ -593,6 +621,66 @@ def label_alloc_assets(assets):
         return toks
 
 
+def _merge_editor_state(base_df, state):
+    """Apply a data_editor edit-state dict ({edited_rows, added_rows,
+    deleted_rows}) onto its base DataFrame. Deletions reference base row
+    positions, so they are applied before additions."""
+    df = base_df.copy()
+    for ridx, changes in (state.get("edited_rows") or {}).items():
+        r = int(ridx)
+        if 0 <= r < len(df) and isinstance(changes, dict):
+            for col, val in changes.items():
+                if col in df.columns:
+                    df.iloc[r, df.columns.get_loc(col)] = val
+    drop = [int(i) for i in (state.get("deleted_rows") or []) if 0 <= int(i) < len(df)]
+    if drop:
+        df = df.drop(index=drop).reset_index(drop=True)
+    add = [row for row in (state.get("added_rows") or []) if isinstance(row, dict)]
+    if add:
+        pad = pd.DataFrame([{c: row.get(c) for c in df.columns} for row in add])
+        try:  # match base dtypes so all-NA pad columns don't warn on concat
+            pad = pad.astype({c: str(df[c].dtype) for c in df.columns})
+        except Exception:
+            pass
+        df = pd.concat([df, pad], ignore_index=True)
+    return df
+
+
+def flush_alloc_edits():
+    """Fold the allocation editor's in-flight edit state into the stored
+    tickers/weights strings; returns the merged frame (or None).
+
+    The editor's edits live in per-widget state keyed by the editor key. Any
+    action that changes that key (add/delete/rename portfolio, searchbox
+    asset add) creates a fresh editor and discards that state — and because
+    those controls render ABOVE the editor, an edit delivered in the same
+    browser event would be lost before sync_alloc ever saw it. Call this
+    before such mutations (the matrix-rebuild block does it for all
+    key-changing paths)."""
+    key = st.session_state.get('_alloc_key')
+    base = st.session_state.get('_alloc_base')
+    state = st.session_state.get(key) if key else None
+    if base is None or not isinstance(state, dict):
+        return None
+    try:
+        merged = _merge_editor_state(base, state)
+        sync_alloc(merged, st.session_state.portfolios_list)
+        # Prune pending rows the user deleted in the editor, HERE while the
+        # edit state is still alive: the engine may clean widget state at the
+        # next rerun boundary, so the rebuild block cannot do this reliably.
+        # Only rows previously shown in the editor (seen) are eligible — a
+        # just-picked token is absent from this frame but must survive.
+        seen = set(st.session_state.get('_alloc_pending_seen', []))
+        if seen:
+            still = {_strip_asset_label(a) for a in merged["Asset"]}
+            st.session_state['_alloc_pending'] = [
+                t for t in st.session_state.get('_alloc_pending', [])
+                if t not in seen or t in still]
+        return merged
+    except Exception:
+        return None  # editor-state format drift: skip rather than corrupt
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def yahoo_symbol_search(query):
     """Ticker/fund-name typeahead via Yahoo's symbol-search endpoint.
@@ -621,13 +709,12 @@ def yahoo_symbol_search(query):
 
 @st.cache_data(ttl=86400)
 def fetch_cpi_data():
-    try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
-        cpi = pd.read_csv(url, parse_dates=['observation_date'], index_col='observation_date')
-        cpi.columns = ['CPI']
-        return cpi
-    except Exception:
-        return None
+    """Raises on failure so a transient FRED outage is NOT cached for 24h
+    (exceptions bypass st.cache_data); the caller falls back to fixed-rate."""
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
+    cpi = pd.read_csv(url, parse_dates=['observation_date'], index_col='observation_date')
+    cpi.columns = ['CPI']
+    return cpi
 
 def render_summary_cards(metrics, color_map):
     """One compact card per series: identity dot + name, hero = annualized
@@ -796,14 +883,10 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Load error: {e}")
 
-    current_config = {
-        "benchmark": st.session_state['bi'],
-        "start_date": str(st.session_state['sd']),
-        "initial_funds": st.session_state['init_funds'],
-        "portfolios": st.session_state.portfolios_list
-    }
-    json_str = json.dumps(current_config, indent=2, ensure_ascii=False)
-    st.download_button(label=":material/download: Export", data=json_str, file_name="backtest_config.json", mime="application/json", width="stretch")
+    # Placeholder only: the sidebar renders BEFORE the main section's write-backs
+    # (row edits, matrix sync). The actual download button is rendered into this
+    # slot at the end of the portfolio section so the payload is this-run fresh.
+    export_slot = st.container()
 
     uploaded_file = st.file_uploader("Import Config", type=["json"], label_visibility="collapsed")
     if uploaded_file is not None:
@@ -859,10 +942,12 @@ with st.container(border=True):
     with act_cols[0]:
         if st.button(":material/add_circle: Add", width="stretch",
                      help="Add a portfolio (copies the last one's allocation)."):
-            last_port = st.session_state.portfolios_list[-1]
-            st.session_state.portfolios_list.append({
+            flush_alloc_edits()  # copy must see edits delivered in this same event
+            ports_now = st.session_state.portfolios_list
+            last_port = ports_now[-1] if ports_now else {"tickers": "", "weights": ""}
+            ports_now.append({
                 "id": str(uuid.uuid4()),
-                "name": next_port_name(st.session_state.portfolios_list),
+                "name": next_port_name(ports_now),
                 "tickers": last_port["tickers"], "weights": last_port["weights"],
                 "strat": STRAT_RD_MIXED, "thr": 40
             })
@@ -873,14 +958,19 @@ with st.container(border=True):
                           "funds) as the startup default — new sessions open with it. Delete "
                           "Backtest/_default.json to restore the built-in config."):
             try:
-                SAVED_CONFIG_DIR.mkdir(exist_ok=True)
-                DEFAULT_CONFIG_PATH.write_text(json.dumps({
-                    "benchmark": st.session_state['bi'],
-                    "start_date": str(st.session_state['sd']),
-                    "initial_funds": st.session_state['init_funds'],
-                    "portfolios": st.session_state.portfolios_list,
-                }, indent=2, ensure_ascii=False), encoding="utf-8")
-                st.toast("Saved — new sessions now open with this setup", icon="✅")
+                flush_alloc_edits()  # save must include edits delivered in this same event
+                _errs = validate_inputs(st.session_state.portfolios_list, st.session_state['bi'])
+                if _errs:
+                    st.error("Default NOT saved — fix first: " + " · ".join(_errs))
+                else:
+                    SAVED_CONFIG_DIR.mkdir(exist_ok=True)
+                    DEFAULT_CONFIG_PATH.write_text(json.dumps({
+                        "benchmark": st.session_state['bi'],
+                        "start_date": str(st.session_state['sd']),
+                        "initial_funds": st.session_state['init_funds'],
+                        "portfolios": st.session_state.portfolios_list,
+                    }, indent=2, ensure_ascii=False), encoding="utf-8")
+                    st.toast("Saved — new sessions now open with this setup", icon="✅")
             except Exception as e:
                 st.error(f"Save default failed: {e}")
 
@@ -892,19 +982,61 @@ with st.container(border=True):
 
     ports = st.session_state.portfolios_list
     port_names = [p['name'] for p in ports]
-    if len(set(port_names)) != len(port_names):
-        st.error("Duplicate portfolio names — rename them above before editing allocations.")
+    name_clash = len(set(port_names)) != len(port_names)
+    asset_clash = any(str(n).strip() == "Asset" for n in port_names)
+    if name_clash or asset_clash:
+        # No editor renders in this state, so its widget state is destroyed at
+        # end-of-run. Drop the anchor: on recovery the same names reproduce the
+        # same key, and reusing it would re-anchor the editor on a stale base —
+        # silently reverting every edit since the last rebuild. ("Asset" would
+        # additionally overwrite the matrix's token column in build_alloc_df.)
+        st.session_state.pop('_alloc_key', None)
+        st.error("Duplicate portfolio names — rename them above before editing allocations."
+                 if name_clash else
+                 '"Asset" is reserved for the matrix\'s first column — rename that portfolio.')
     else:
+        # Surface storage the matrix cannot faithfully represent BEFORE the
+        # first sync rewrites it: ragged or unparseable weights in imported /
+        # hand-edited configs would otherwise be dropped with no trace.
+        _lossy = []
+        for p in ports:
+            _toks = _slot_tokens(p.get("tickers", ""))
+            _wr = [w.strip() for w in str(p.get("weights", "")).replace("，", ",").split(",") if w.strip()]
+            _bad = False
+            for w in _wr:
+                try:
+                    float(w)
+                except ValueError:
+                    _bad = True
+            if _toks and (_bad or len(_wr) != len(_toks)):
+                _lossy.append(p['name'])
+        if _lossy:
+            st.warning("**" + ", ".join(_lossy) + "**: weights don't align with tickers "
+                       "(count mismatch or unparseable value). Misaligned tickers show a "
+                       "blank weight below and drop from the stored config when the matrix "
+                       "syncs — fill their weights now or re-import a corrected JSON.")
+
         alloc_key = _alloc_struct_key(ports)
         if st.session_state.get('_alloc_key') != alloc_key:
+            # The key changed this run (port added/deleted/renamed or searchbox
+            # add): fold the outgoing editor's in-flight edits into the strings
+            # FIRST, or edits delivered in this same browser event are lost.
+            flush_alloc_edits()
             st.session_state['_alloc_key'] = alloc_key
             base = build_alloc_df(ports)
             # Assets added via search keep a pending row (no weight anywhere yet)
             # until the user fills a weight; then they live in the strings and
-            # the pending entry is pruned.
+            # the pending entry is pruned. A pending row the user deleted in the
+            # editor (absent from the merged frame) is dropped for good instead
+            # of resurrecting on every rebuild.
             existing = set(str(a).strip() for a in base["Asset"])
-            pending = [t for t in st.session_state.get('_alloc_pending', []) if t not in existing]
+            # Deleted-row pruning already happened inside flush_alloc_edits
+            # (while the editor state was still alive); here only tokens that
+            # gained a weight (now in the strings) leave the pending list.
+            pending = [t for t in st.session_state.get('_alloc_pending', [])
+                       if t not in existing]
             st.session_state['_alloc_pending'] = pending
+            st.session_state['_alloc_pending_seen'] = list(pending)
             if pending:
                 pad = pd.DataFrame({"Asset": pending,
                                     **{p['name']: [None] * len(pending) for p in ports}})
@@ -929,6 +1061,12 @@ with st.container(border=True):
                 if tok not in rows_now and tok not in pend:
                     pend.append(tok)
                     st.session_state['_alloc_nonce'] = st.session_state.get('_alloc_nonce', 0) + 1
+                    # Consume the pick: st_searchbox returns the last result on
+                    # every rerun otherwise, resurrecting removed assets on each
+                    # rebuild and leaking into freshly loaded configs.
+                    _sb_state = st.session_state.get("asset_search")
+                    if isinstance(_sb_state, dict):
+                        _sb_state["result"] = None
                     st.rerun()
 
         col_cfg = {"Asset": st.column_config.TextColumn(
@@ -966,6 +1104,19 @@ with st.container(border=True):
             else:
                 st.session_state.run_backtest = False
                 for msg in error_msgs: st.error(msg)
+
+# Rendered into the sidebar slot AFTER the portfolio section so the exported
+# JSON reflects this run's row edits and matrix sync (not last run's state).
+with export_slot:
+    st.download_button(
+        label=":material/download: Export",
+        data=json.dumps({
+            "benchmark": st.session_state['bi'],
+            "start_date": str(st.session_state['sd']),
+            "initial_funds": st.session_state['init_funds'],
+            "portfolios": st.session_state.portfolios_list,
+        }, indent=2, ensure_ascii=False),
+        file_name="backtest_config.json", mime="application/json", width="stretch")
 
 st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
@@ -1024,8 +1175,14 @@ if st.session_state.run_backtest:
         all_port_tks = sorted({t for _, p_tks, _, _ in parsed_ports for t in p_tks})
         raw_aligned = df_aligned[all_port_tks]
         first_valid_idx = raw_aligned.apply(lambda x: x.first_valid_index())
-        bottleneck_date = first_valid_idx.max()
-        bottleneck_ticker = first_valid_idx.idxmax()
+        # Guard idxmax: empty (no portfolio tickers) or all-None (every ticker
+        # dataless) raises / is deprecated in pandas. Downstream per-portfolio
+        # "no usable data" errors handle the degenerate cases.
+        if first_valid_idx.notna().any():
+            bottleneck_date = first_valid_idx.max()
+            bottleneck_ticker = first_valid_idx.dropna().idxmax()
+        else:
+            bottleneck_date, bottleneck_ticker = pd.NaT, None
         actual_start_day = market_start_day
 
         days_diff_bench = (market_start_day.date() - pd.Timestamp(start_d).date()).days
@@ -1099,6 +1256,12 @@ if st.session_state.run_backtest:
             # byte-identical to the legacy un-normalized weights). One-shot
             # normalization handles intra-slot re-split + cross-slot drop together.
             if dropped_elems or dropped_slots:
+                if w_series.sum() <= 0:
+                    # e.g. every nonzero-weight slot was dataless: 0/0 -> NaN
+                    # weights would silently produce an empty backtest.
+                    st.error(f"**{p['name']}**: surviving tickers carry no positive weight "
+                             f"after dropping dataless ones — portfolio skipped.")
+                    continue
                 w_series = w_series / w_series.sum()
             if dropped_elems:
                 st.warning(
@@ -1156,7 +1319,10 @@ if st.session_state.run_backtest:
         if inf_adj:
             start_ts = pd.Timestamp(actual_start_day)
             end_ts = comp_df.index[-1]
-            cpi_raw = fetch_cpi_data()
+            try:
+                cpi_raw = fetch_cpi_data()
+            except Exception:
+                cpi_raw = None
             if cpi_raw is not None:
                 cpi_yearly = cpi_raw['CPI'].resample('YS').first()
                 yearly_inf = []
@@ -1170,15 +1336,21 @@ if st.session_state.run_backtest:
                     yearly_inf.append({"Year": y, "Inflation(%)": round(rate, 2)})
                 inf_df = pd.DataFrame(yearly_inf)
                 with st.expander("CPI Inflation Rates (editable)", expanded=False):
-                    edited_inf = st.data_editor(inf_df, hide_index=True, width="stretch")
-                rate_map = dict(zip(edited_inf['Year'].astype(int), edited_inf['Inflation(%)'] / 100))
+                    edited_inf = st.data_editor(
+                        inf_df, hide_index=True, width="stretch",
+                        column_config={"Year": st.column_config.NumberColumn(
+                            "Year", disabled=True, format="%d")})
+                rate_map = dict(zip(edited_inf['Year'].astype(int), edited_inf['Inflation(%)'].fillna(3.0) / 100))
                 discount_factors = pd.Series(1.0, index=comp_df.index)
                 for i, date in enumerate(comp_df.index):
                     factor = 1.0
                     for y in range(start_ts.year, date.year + 1):
                         rate = rate_map.get(y, 0.03)
                         y_begin = max(pd.Timestamp(f"{y}-01-01"), start_ts)
-                        y_end = min(pd.Timestamp(f"{y}-12-31"), date)
+                        # Exclusive upper bound (Jan 1 of y+1): a full calendar
+                        # year discounts as ~365/365.25, and the Dec31->Jan1
+                        # boundary day is counted exactly once.
+                        y_end = min(pd.Timestamp(f"{y + 1}-01-01"), date)
                         if y_begin > date or y_end < start_ts: continue
                         frac = (y_end - y_begin).days / 365.25
                         factor *= (1 + rate) ** frac
