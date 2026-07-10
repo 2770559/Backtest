@@ -5,6 +5,7 @@ import numpy as np
 import altair as alt
 import requests
 import re
+import threading
 import uuid
 import json
 from datetime import datetime, timedelta
@@ -27,7 +28,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.3.0"  # semver: major.minor.patch
+APP_VERSION = "2.3.1"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
@@ -497,17 +498,28 @@ def _alloc_struct_key(ports):
 CN_NAME_SEED = {
     "159915.SZ": "创业板ETF易方达", "159941.SZ": "纳指ETF广发", "159985.SZ": "豆粕ETF华夏",
     "510300.SS": "沪深300ETF华泰柏瑞", "511010.SS": "国债ETF国泰", "511130.SS": "30年国债ETF博时",
-    "512400.SS": "有色金属ETF南方", "512890.SS": "红利低波ETF华泰柏瑞", "513500.SS": "标普500ETF博时",
-    "515220.SS": "煤炭ETF国泰", "518880.SS": "黄金ETF华安", "588080.SS": "科创50ETF易方达",
+    "512400.SS": "有色金属ETF南方", "512890.SS": "红利低波ETF华泰柏瑞", "513100.SS": "纳指ETF国泰",
+    "513500.SS": "标普500ETF博时", "515100.SS": "红利低波100ETF景顺", "515220.SS": "煤炭ETF国泰",
+    "518880.SS": "黄金ETF华安", "588080.SS": "科创50ETF易方达",
 }
 NAME_SEP = " - "
+
+
+# Process-lifetime circuit breaker: from hosts that can't reach Tencent's CDN
+# (e.g. Streamlit Cloud), DNS resolution can HANG — requests' timeout does not
+# cover getaddrinfo — wedging the script thread until the platform kills the
+# app. After 2 straight failures the endpoint is never tried again in this
+# process and labels come from CN_NAME_SEED only.
+_cn_name_failures = {"n": 0}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_cn_names(symbols):
     """Batch-resolve .SS/.SZ tickers to Chinese short names via Tencent's
-    quote API (GBK payload, no auth). Failures fall back to CN_NAME_SEED;
-    tickers absent from the result simply display as the bare code."""
+    quote API (GBK payload, no auth). The HTTP call runs on a daemon thread
+    with a hard 4s deadline so even a hung DNS lookup can't block the script.
+    Failures fall back to CN_NAME_SEED; tickers absent from the result simply
+    display as the bare code."""
     codes = {}
     for tk in symbols:
         tk = str(tk).strip().upper()
@@ -516,18 +528,30 @@ def fetch_cn_names(symbols):
         elif tk.endswith(".SZ") and tk[:-3].isdigit():
             codes["sz" + tk[:-3]] = tk
     out = dict(CN_NAME_SEED)
-    if not codes:
+    if not codes or _cn_name_failures["n"] >= 2:
         return out
-    try:
-        r = requests.get("https://qt.gtimg.cn/q=" + ",".join(codes),
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
-        payload = r.content.decode("gbk", errors="replace")
-        for m in re.finditer(r'v_(s[hz]\d+)="([^"]*)"', payload):
-            parts = m.group(2).split("~")
-            if len(parts) > 2 and parts[1] and m.group(1) in codes:
-                out[codes[m.group(1)]] = parts[1]
-    except Exception:
-        pass
+    box = {}
+
+    def _worker():
+        try:
+            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(codes),
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+            box["payload"] = r.content.decode("gbk", errors="replace")
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(4.0)
+    payload = box.get("payload")
+    if payload is None:
+        _cn_name_failures["n"] += 1
+        return out
+    _cn_name_failures["n"] = 0
+    for m in re.finditer(r'v_(s[hz]\d+)="([^"]*)"', payload):
+        parts = m.group(2).split("~")
+        if len(parts) > 2 and parts[1] and m.group(1) in codes:
+            out[codes[m.group(1)]] = parts[1]
     return out
 
 
@@ -551,16 +575,20 @@ def _strip_asset_label(label):
 
 
 def label_alloc_assets(assets):
-    """Label a whole Asset column with one batched name fetch for CN tickers."""
+    """Label a whole Asset column with one batched name fetch for CN tickers.
+    Never raises: on any failure the column falls back to bare codes."""
     toks = [str(a).strip() for a in assets]
-    cn = sorted({clean_ticker(m)
-                 for t in toks
-                 for m in (t[1:-1].split(",") if t.startswith("(") and t.endswith(")") else [t])
-                 if m.strip() and clean_ticker(m).endswith((".SS", ".SZ"))})
-    if not cn:
+    try:
+        cn = sorted({clean_ticker(m)
+                     for t in toks
+                     for m in (t[1:-1].split(",") if t.startswith("(") and t.endswith(")") else [t])
+                     if m.strip() and clean_ticker(m).endswith((".SS", ".SZ"))})
+        if not cn:
+            return toks
+        names = fetch_cn_names(tuple(cn))
+        return [_label_asset(t, names) for t in toks]
+    except Exception:
         return toks
-    names = fetch_cn_names(tuple(cn))
-    return [_label_asset(t, names) for t in toks]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
