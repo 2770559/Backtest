@@ -28,7 +28,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.3.1"  # semver: major.minor.patch
+APP_VERSION = "2.3.2"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
@@ -408,9 +408,11 @@ def next_port_name(ports):
     return f"Port {_n_to_letters(n)}"
 
 # --- 2. Data Fetch & Validation Helpers ---
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=8)
 def fetch_price_history(tickers, start):
-    """Cached wrapper around yf.download so widget interactions don't re-hit Yahoo."""
+    """Cached wrapper around yf.download so widget interactions don't re-hit Yahoo.
+    max_entries bounds memory on small cloud containers: every distinct ticker
+    set caches its own download for the TTL."""
     return yf.download(list(tickers), start=start, progress=False)
 
 def validate_inputs(portfolios, benchmark):
