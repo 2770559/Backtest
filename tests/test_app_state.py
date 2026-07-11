@@ -225,6 +225,36 @@ class EditorStateWipeTest(unittest.TestCase):
         self.assertEqual(float(base2.loc[row2, "AV-US"]), 20.0)
 
 
+class SaveDefaultDialogTest(unittest.TestCase):
+    """Save Default must not write anything until confirmed in the dialog.
+
+    AppTest limitation: st.dialog interactions are fragment reruns, which
+    AppTest does not simulate — clicks on dialog-internal buttons are never
+    observed by the dialog function. The confirm/reset paths are therefore
+    covered by real-browser E2E; here we lock in the click-side contract."""
+
+    def setUp(self):
+        self.default_path = APP_DIR / "Backtest" / "_default.json"
+        self.assertFalse(self.default_path.exists(),
+                         "pre-existing default would taint this test")
+
+    def tearDown(self):
+        self.default_path.unlink(missing_ok=True)
+
+    def test_click_alone_saves_nothing_and_opens_dialog(self):
+        at = AppTest.from_file(APP, default_timeout=120).run()
+        save = [b for b in at.button if "Save Default" in str(b.label)][0]
+        save.click()
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertFalse(self.default_path.exists(),
+                         "file written without confirmation")
+        labels = [str(b.label) for b in at.button]
+        self.assertTrue(any("Confirm & Save" in l for l in labels),
+                        "confirmation dialog did not open")
+        self.assertTrue(any(l.strip() == "Cancel" for l in labels))
+
+
 class SaveDefaultValidationTest(unittest.TestCase):
     def test_invalid_config_not_saved(self):
         default_path = APP_DIR / "Backtest" / "_default.json"

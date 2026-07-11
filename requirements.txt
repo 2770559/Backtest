@@ -17,3 +17,4 @@ pillow==12.1.0
 curl_cffi==0.13.0
 lxml==6.0.2
 tornado==6.5.4
+streamlit-js-eval==1.0.0

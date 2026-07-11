@@ -17,6 +17,12 @@ try:
 except ImportError:            # optional dependency: matrix still accepts typed tickers
     HAS_SEARCHBOX = False
 
+try:
+    from streamlit_js_eval import streamlit_js_eval
+    HAS_JS_EVAL = True
+except ImportError:            # optional dependency: browser-persisted default disabled
+    HAS_JS_EVAL = False
+
 from backtest_core import (
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
     STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
@@ -28,7 +34,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.3.5"  # semver: major.minor.patch
+APP_VERSION = "2.4.0"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-07-10"
 
 # --- 1. Page Config ---
@@ -266,6 +272,11 @@ button[kind="secondary"] {
     transition: all 0.15s !important;
 }
 
+/* ===== Invisible utility components (localStorage bridge) ===== */
+div[data-testid="stElementContainer"]:has(iframe[title="streamlit_js_eval.streamlit_js_eval"]) {
+    display: none;
+}
+
 /* ===== Sidebar ===== */
 section[data-testid="stSidebar"] > div:first-child { padding-top: 1.25rem; }
 section[data-testid="stSidebar"] h3 {
@@ -388,6 +399,35 @@ if 'portfolios_list' not in st.session_state:
             "thr": 38
         }
     ]
+
+# --- Browser-persisted startup default -------------------------------------
+# Streamlit Cloud rebuilds the container on every deploy/reboot, wiping
+# Backtest/_default.json. Save Default therefore ALSO stores the config in
+# the browser's localStorage; on session start, when no file default exists,
+# it is restored from there. The file (local workflow) always wins.
+LS_DEFAULT_KEY = "backtest_default_config"
+
+if DEFAULT_CONFIG_PATH.is_file():
+    st.session_state['_ls_checked'] = True     # file default already applied
+    st.session_state['_ls_default_present'] = True
+if HAS_JS_EVAL and not st.session_state.get('_ls_checked'):
+    _ls_raw = streamlit_js_eval(
+        js_expressions=f"localStorage.getItem({json.dumps(LS_DEFAULT_KEY)}) ?? '__none__'",
+        key="_ls_get")
+    if _ls_raw == '__none__':
+        st.session_state['_ls_checked'] = True
+    elif isinstance(_ls_raw, str) and _ls_raw:
+        st.session_state['_ls_checked'] = True
+        st.session_state['_ls_default_present'] = True
+        # Apply only while the session is pristine (no results on screen).
+        if not st.session_state.run_backtest:
+            try:
+                _ls_cfg = json.loads(_ls_raw)
+                if _ls_cfg.get("portfolios"):
+                    _apply_config_state(_ls_cfg)
+                    st.rerun()
+            except Exception:
+                pass
 
 def delete_portfolio(idx):
     if 0 <= idx < len(st.session_state.portfolios_list):
@@ -854,6 +894,53 @@ def apply_config(loaded_config):
     _apply_config_state(loaded_config)  # leaves run_backtest False: explicit Analyze required
     st.rerun()
 
+
+@st.dialog("Set startup default")
+def _confirm_save_default():
+    """Confirmation gate for Save Default (accidental clicks would silently
+    replace the persisted setup). Also hosts the reset-to-built-ins action."""
+    ports = st.session_state.portfolios_list
+    st.markdown(
+        "New sessions will open with **" + ", ".join(p['name'] for p in ports) + "** · "
+        f"benchmark `{st.session_state['bi']}` · start {st.session_state['sd']} · "
+        f"${st.session_state['init_funds']:,}")
+    has_saved = DEFAULT_CONFIG_PATH.is_file() or st.session_state.get('_ls_default_present')
+    if has_saved:
+        st.warning("A saved default already exists — Confirm will **replace** it.")
+    c1, c2 = st.columns(2)
+    if c1.button("Confirm & Save", type="primary", width="stretch"):
+        payload = json.dumps({
+            "benchmark": st.session_state['bi'],
+            "start_date": str(st.session_state['sd']),
+            "initial_funds": st.session_state['init_funds'],
+            "portfolios": st.session_state.portfolios_list,
+        }, indent=2, ensure_ascii=False)
+        try:
+            SAVED_CONFIG_DIR.mkdir(exist_ok=True)
+            DEFAULT_CONFIG_PATH.write_text(payload, encoding="utf-8")
+        except Exception as e:      # cloud FS quirks: browser copy still proceeds
+            st.toast(f"File save failed: {e}", icon="⚠️")
+        if HAS_JS_EVAL:
+            st.session_state['_ls_payload'] = payload      # -> localStorage setItem
+            st.session_state['_ls_nonce'] = str(uuid.uuid4())[:8]
+        st.session_state['_ls_default_present'] = True
+        st.session_state['_flash_toast'] = "Saved — new sessions now open with this setup"
+        st.rerun()
+    if c2.button("Cancel", width="stretch"):
+        st.rerun()
+    if has_saved:
+        st.divider()
+        if st.button(":material/restart_alt: Reset default to built-ins", width="stretch",
+                     help="Delete the saved default (file + this browser's copy); new "
+                          "sessions open with the built-in config again."):
+            DEFAULT_CONFIG_PATH.unlink(missing_ok=True)
+            if HAS_JS_EVAL:
+                st.session_state['_ls_payload'] = ""       # "" -> localStorage removeItem
+                st.session_state['_ls_nonce'] = str(uuid.uuid4())[:8]
+            st.session_state['_ls_default_present'] = False
+            st.session_state['_flash_toast'] = "Default reset — new sessions open with built-ins"
+            st.rerun()
+
 with st.sidebar:
     st.markdown("### Settings")
 
@@ -960,24 +1047,16 @@ with st.container(border=True):
     with act_cols[1]:
         if st.button(":material/bookmark_add: Save Default", width="stretch",
                      help="Save the current setup (portfolios, benchmark, start date, initial "
-                          "funds) as the startup default — new sessions open with it. Delete "
-                          "Backtest/_default.json to restore the built-in config."):
-            try:
-                flush_alloc_edits()  # save must include edits delivered in this same event
-                _errs = validate_inputs(st.session_state.portfolios_list, st.session_state['bi'])
-                if _errs:
-                    st.error("Default NOT saved — fix first: " + " · ".join(_errs))
-                else:
-                    SAVED_CONFIG_DIR.mkdir(exist_ok=True)
-                    DEFAULT_CONFIG_PATH.write_text(json.dumps({
-                        "benchmark": st.session_state['bi'],
-                        "start_date": str(st.session_state['sd']),
-                        "initial_funds": st.session_state['init_funds'],
-                        "portfolios": st.session_state.portfolios_list,
-                    }, indent=2, ensure_ascii=False), encoding="utf-8")
-                    st.toast("Saved — new sessions now open with this setup", icon="✅")
-            except Exception as e:
-                st.error(f"Save default failed: {e}")
+                          "funds) as the startup default — new sessions open with it. Stored "
+                          "in Backtest/_default.json AND this browser (the browser copy "
+                          "survives cloud redeploys). A confirmation dialog guards against "
+                          "accidental clicks and offers reset-to-built-ins."):
+            flush_alloc_edits()  # save must include edits delivered in this same event
+            _errs = validate_inputs(st.session_state.portfolios_list, st.session_state['bi'])
+            if _errs:
+                st.error("Default NOT saved — fix first: " + " · ".join(_errs))
+            else:
+                _confirm_save_default()
 
     # --- Allocation matrix: one row per slot, one % column per portfolio ---
     st.markdown(
@@ -1126,6 +1205,23 @@ with st.container(border=True):
             else:
                 st.session_state.run_backtest = False
                 for msg in error_msgs: st.error(msg)
+
+if _t := st.session_state.pop('_flash_toast', None):
+    st.toast(_t, icon="✅")
+
+# localStorage writer: renders while a Save/Reset payload is pending and
+# unmounts once the browser confirms execution (unique nonce per action, so
+# a stale component value can never clear a newer payload prematurely).
+if HAS_JS_EVAL and st.session_state.get('_ls_payload') is not None:
+    _ls_ok = "OK" + st.session_state.get('_ls_nonce', '')
+    if st.session_state['_ls_payload'] == "":
+        _ls_expr = (f"(localStorage.removeItem({json.dumps(LS_DEFAULT_KEY)}), "
+                    f"{json.dumps(_ls_ok)})")
+    else:
+        _ls_expr = (f"(localStorage.setItem({json.dumps(LS_DEFAULT_KEY)}, "
+                    f"{json.dumps(st.session_state['_ls_payload'])}), {json.dumps(_ls_ok)})")
+    if streamlit_js_eval(js_expressions=_ls_expr, key="_ls_set") == _ls_ok:
+        st.session_state.pop('_ls_payload', None)
 
 # Rendered into the sidebar slot AFTER the portfolio section so the exported
 # JSON reflects this run's row edits and matrix sync (not last run's state).
