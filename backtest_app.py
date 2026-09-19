@@ -6,6 +6,7 @@ import altair as alt
 import requests
 import re
 import threading
+import time
 import uuid
 import json
 from datetime import datetime, timedelta
@@ -34,8 +35,8 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.4.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-07-10"
+APP_VERSION = "2.4.1"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-19"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -459,17 +460,158 @@ def next_port_name(ports):
     return f"Port {_n_to_letters(n)}"
 
 # --- 2. Data Fetch & Validation Helpers ---
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=8)
-def fetch_price_history(tickers, start):
-    """Cached wrapper around yf.download so widget interactions don't re-hit Yahoo.
-    max_entries bounds memory on small cloud containers: every distinct ticker
-    set caches its own download for the TTL. Raises on an empty result so a
-    transient Yahoo failure is NOT cached for the full TTL (exceptions bypass
-    st.cache_data); the caller already handles download exceptions."""
-    df = yf.download(list(tickers), start=start, progress=False)
+# Prices are cached PER TICKER, not per ticker set: editing a portfolio only
+# requests the tickers not already held, and one ticker's failure can never
+# poison another's data.
+#
+# Before v2.4.1 the whole yf.download frame was cached per ticker set, and the
+# price level was chosen for the whole frame ('Adj Close' if present, else
+# 'Close'). yfinance never raises for a subset failure: a ticker whose request
+# failed (Yahoo rate limit, network hiccup, unknown symbol) comes back as an
+# EMPTY placeholder column -- and that placeholder carries an 'Adj Close'
+# level which auto-adjusted real data lacks. So one failed ticker made the app
+# select a frame holding nothing but that empty column, every ticker looked
+# dataless ("No data after <start>"), and the partial frame was served from
+# cache for the full hour. Deleting a portfolio triggered it: the changed set
+# was a cache miss, and the fresh batch hit Yahoo's rate limit for one ticker.
+PRICE_CACHE_TTL = 3600       # seconds a fetched series is reused
+PRICE_CACHE_MISS_TTL = 60    # seconds a failed ticker is not re-requested by widget reruns
+PRICE_CACHE_MAX = 256        # distinct tickers kept (a few thousand floats each); oldest evicted
+PRICE_RETRY_PAUSE = 1.0      # seconds before the single retry of a non-rate-limited failure
+_RATE_LIMIT_MARKERS = ("rate limit", "too many requests")
+
+
+@st.cache_resource(show_spinner=False)
+def _price_cache():
+    """Process-wide singleton (same object on every rerun, for every session):
+    {"lock": Lock, "entries": {ticker: {expires, start, series|None, reason}}}.
+    The lock also serializes yf.download calls, whose per-ticker results go
+    through yfinance's module-global state (yf.shared) and would otherwise be
+    corrupted by two sessions downloading at once."""
+    return {"lock": threading.Lock(), "entries": {}}
+
+
+def clear_price_cache():
+    _price_cache.clear()
+
+
+def forget_failed_prices():
+    """Drop the negative entries so an explicit Analyze re-requests every
+    ticker that had no data, whatever is left of PRICE_CACHE_MISS_TTL."""
+    cache = _price_cache()
+    with cache["lock"]:
+        for tk in [k for k, e in cache["entries"].items() if e["series"] is None]:
+            del cache["entries"][tk]
+
+
+def _is_rate_limited(reason):
+    return any(m in str(reason).lower() for m in _RATE_LIMIT_MARKERS)
+
+
+def _tidy_reason(reason):
+    """yf.shared._ERRORS holds repr(exception): "YFRateLimitError('Too Many
+    Requests. ...')" -> "Too Many Requests. ..."."""
+    m = re.fullmatch(r"\w+\((['\"])(.*)\1\)", str(reason).strip(), flags=re.S)
+    return m.group(2) if m else str(reason).strip()
+
+
+def _extract_close(df, tk, single=False):
+    """Adjusted-close Series for ONE ticker out of a yf.download frame, or None
+    when the ticker has no price at all. Selection is per ticker on purpose: a
+    failed ticker's placeholder must never decide the price level used for the
+    others (see the note above). `single`: frame of a lone ticker without a
+    ticker level (older yfinance), whose columns are the price fields."""
     if df is None or df.empty:
-        raise RuntimeError("Yahoo returned no data (transient failure or rate limit)")
-    return df
+        return None
+    cols = df.columns
+    if isinstance(cols, pd.MultiIndex):
+        candidates = [(lvl, tk) for lvl in ("Adj Close", "Close") if (lvl, tk) in cols]
+    elif single:
+        candidates = [lvl for lvl in ("Adj Close", "Close") if lvl in cols]
+    else:
+        candidates = []
+    for c in candidates:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().any():
+            return s.rename(tk)
+    return None
+
+
+def _batch_close(tickers, start, download):
+    """One yf.download batch -> ({ticker: close Series}, {ticker: reason}).
+    Every requested ticker is validated here, since a subset failure is
+    silent (empty placeholder column + reason in yf.shared._ERRORS)."""
+    yf.shared._ERRORS = {}
+    df = download(list(tickers), start=start, auto_adjust=True, progress=False)
+    reasons = {str(k).upper(): _tidy_reason(v) for k, v in (yf.shared._ERRORS or {}).items()}
+    good, bad = {}, {}
+    for tk in tickers:
+        s = _extract_close(df, tk, single=len(tickers) == 1)
+        if s is None:
+            bad[tk] = reasons.get(tk.upper(), "Yahoo returned no prices")
+        else:
+            good[tk] = s
+    return good, bad
+
+
+def fetch_price_history(tickers, start, download=None, now=None):
+    """Adjusted-close history from `start`, one column per ticker, through
+    the per-ticker cache. Returns (prices, failures): `failures` maps each
+    ticker that has no price at all to Yahoo's reason (its column is NaN).
+
+    Only tickers without a live entry are requested, in one threaded
+    yf.download batch, so add/delete/rename never re-downloads what an earlier
+    run fetched. A ticker that came back empty is retried once -- never when
+    rate limited, that only extends the block -- then negatively cached for
+    PRICE_CACHE_MISS_TTL so widget reruns don't re-hit Yahoo (Analyze clears
+    it, see forget_failed_prices). Raises when the download itself fails, so
+    nothing is cached. `download`/`now` are injection points for tests."""
+    tickers = list(dict.fromkeys(tickers))
+    download = download or yf.download
+    now = time.time() if now is None else now
+    start_ts = pd.Timestamp(start)
+    cache = _price_cache()
+    with cache["lock"]:
+        entries = cache["entries"]
+
+        def live(tk):
+            e = entries.get(tk)
+            return e is not None and e["expires"] > now and e["start"] <= start_ts
+
+        missing = [tk for tk in tickers if not live(tk)]
+        if missing:
+            good, bad = _batch_close(missing, start, download)
+            retry = [tk for tk, why in bad.items() if not _is_rate_limited(why)]
+            if retry:
+                time.sleep(PRICE_RETRY_PAUSE)
+                good2, bad2 = _batch_close(retry, start, download)
+                good.update(good2)
+                bad = {tk: why for tk, why in bad.items() if tk not in good2}
+                bad.update(bad2)
+            for tk, s in good.items():
+                entries[tk] = {"expires": now + PRICE_CACHE_TTL, "start": start_ts,
+                               "series": s, "reason": None}
+            for tk, why in bad.items():
+                entries[tk] = {"expires": now + PRICE_CACHE_MISS_TTL, "start": start_ts,
+                               "series": None, "reason": why}
+            if len(entries) > PRICE_CACHE_MAX:
+                oldest = sorted(entries, key=lambda k: entries[k]["expires"])
+                for tk in oldest[:len(entries) - PRICE_CACHE_MAX]:
+                    del entries[tk]
+        frames, failures = [], {}
+        for tk in tickers:
+            e = entries[tk]
+            if e["series"] is None:
+                failures[tk] = e["reason"]
+            else:
+                frames.append(e["series"])
+    prices = pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
+    if len(prices):
+        prices = prices[prices.index >= start_ts]
+    for tk in tickers:
+        if tk not in prices.columns:
+            prices[tk] = np.nan
+    return prices[tickers].copy(), failures
 
 # Series names that collide with chart/table plumbing (index/melt names) or
 # the allocation matrix's token column ("Asset").
@@ -1201,6 +1343,7 @@ with st.container(border=True):
         if run_clicked:
             error_msgs = validate_inputs(st.session_state.portfolios_list, bench_in)
             if not error_msgs:
+                forget_failed_prices()   # an explicit Analyze re-requests what had no data
                 st.session_state.run_backtest = True
             else:
                 st.session_state.run_backtest = False
@@ -1253,18 +1396,25 @@ if st.session_state.run_backtest:
         parsed_ports.append((p, p_tks, p_wts, p_comp))
 
     with st.spinner('Fetching data & running backtest...'):
-        all_tks = sorted(set([clean_ticker(bench_in)] + [t for _, p_tks, _, _ in parsed_ports for t in p_tks]))
+        bench_tk = clean_ticker(bench_in)
+        all_tks = sorted(set([bench_tk] + [t for _, p_tks, _, _ in parsed_ports for t in p_tks]))
         try:
-            df_raw = fetch_price_history(tuple(all_tks), str(start_d - timedelta(days=20)))
+            price_data, fetch_failures = fetch_price_history(
+                tuple(all_tks), str(start_d - timedelta(days=20)))
         except Exception as e:
+            # Nothing was cached; show once and let the next Analyze retry
+            # instead of re-hitting Yahoo on every widget rerun.
+            st.session_state.run_backtest = False
             st.error(f"Download error: {e}"); st.stop()
-        if df_raw is None or df_raw.empty: st.error("Download failed."); st.stop()
-
-        if 'Adj Close' in df_raw.columns.get_level_values(0): price_data = df_raw['Adj Close'].copy()
-        elif 'Close' in df_raw.columns.get_level_values(0): price_data = df_raw['Close'].copy()
-        else: price_data = df_raw.copy()
-        for tk in all_tks:
-            if tk not in price_data.columns: price_data[tk] = np.nan
+        if bench_tk in fetch_failures:
+            st.session_state.run_backtest = False
+            st.error(f"Benchmark **{bench_tk}** could not be downloaded: {fetch_failures[bench_tk]}. "
+                     "Nothing was cached \u2014 wait a moment and click Analyze again.")
+            st.stop()
+        if fetch_failures:
+            st.warning("Yahoo returned no prices for "
+                       + "; ".join(f"**{tk}** ({why})" for tk, why in fetch_failures.items())
+                       + " \u2014 excluded from this run; click Analyze again to retry.")
 
         # Scrub data glitches: corrupted listing-day prints (wrong scale on day 1)
         # and isolated mid-series spikes that revert on the next print. Genuine
@@ -1276,12 +1426,13 @@ if st.session_state.run_backtest:
         if spiked:
             st.warning("Dropped isolated mid-series price glitch(es): " + "; ".join(spiked))
 
-        bench_tk = clean_ticker(bench_in)
-        if bench_tk not in price_data.columns: st.error(f"Benchmark {bench_tk} not found."); st.stop()
-
         bench_valid_days = price_data[bench_tk].dropna().index
         future_days = bench_valid_days[bench_valid_days >= pd.Timestamp(start_d)]
-        if future_days.empty: st.error(f"No data after {start_d}."); st.stop()
+        if future_days.empty:
+            last = f" (last print {bench_valid_days[-1].date()})" if len(bench_valid_days) else ""
+            st.error(f"Benchmark **{bench_tk}** has no prices on or after {start_d}{last} "
+                     "\u2014 delisted? Pick another benchmark.")
+            st.stop()
         market_start_day = future_days[0]
 
         # ffill on full calendar first so weekend crypto prices carry to next trading day
