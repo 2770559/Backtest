@@ -35,7 +35,7 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.4.1"  # semver: major.minor.patch
+APP_VERSION = "2.4.2"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-09-19"
 
 # --- 1. Page Config ---
@@ -1452,20 +1452,27 @@ if st.session_state.run_backtest:
             bottleneck_ticker = first_valid_idx.dropna().idxmax()
         else:
             bottleneck_date, bottleneck_ticker = pd.NaT, None
-        actual_start_day = market_start_day
+        # A portfolio asset listing after the start moves the start to its listing
+        # day, however late the benchmark itself listed: it would otherwise be
+        # bfilled into flat fabricated prices for the whole pre-listing stretch.
+        late_ticker = pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7
+        actual_start_day = bottleneck_date if late_ticker else market_start_day
 
-        days_diff_bench = (market_start_day.date() - pd.Timestamp(start_d).date()).days
-        if days_diff_bench > 7:
-            st.warning(f"Benchmark **{bench_tk}** not listed until {market_start_day.date()}, start date adjusted.")
+        # ONE notice, naming whatever finally decided the start day. The steps
+        # it overrides (weekend/holiday alignment, benchmark listing) describe a
+        # date the backtest never starts on, so reporting them too was noise at
+        # best and misleading at worst ("Aligned to 2020-01-02" above a run
+        # that KMLM pushed to 2020-12-02).
+        requested = pd.Timestamp(start_d).date()
+        days_diff_bench = (market_start_day.date() - requested).days
+        if late_ticker:
+            st.warning(f"**{bottleneck_ticker}** listed late \u2014 backtest starts "
+                       f"{actual_start_day.date()} (requested {requested}).")
+        elif days_diff_bench > 7:
+            st.warning(f"Benchmark **{bench_tk}** not listed until {market_start_day.date()} "
+                       f"\u2014 backtest starts there (requested {requested}).")
         elif days_diff_bench > 0:
             st.info(f"Aligned to next trading day: {market_start_day.date()}")
-
-        # Must run regardless of how late the benchmark listed: any portfolio asset
-        # listing after the start would otherwise be bfilled into flat fabricated
-        # prices for the whole pre-listing stretch.
-        if pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7:
-            actual_start_day = bottleneck_date
-            st.warning(f"**{bottleneck_ticker}** listed late ({bottleneck_date.date()}), start date adjusted.")
 
         final_data = df_filled[df_filled.index >= actual_start_day]
         if final_data.empty: st.error("Insufficient data."); st.stop()

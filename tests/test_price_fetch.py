@@ -16,9 +16,13 @@ retry.
 
 No network: yf.download is replaced by a fake that builds frames in
 yfinance's exact layout (placeholder included) and fills yf.shared._ERRORS.
+
+StartDateNoticeTest (v2.4.2) reuses the same fake: exactly one notice about
+the effective start day, naming whatever finally decided it.
 """
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -44,9 +48,11 @@ TWO_PORT = ('BRK-B', 'DBMF', 'ETH-USD', 'GLDM', 'KMLM', 'MSTR', 'QQQM', 'SPY', '
 START = "2019-12-12"
 
 
-def _series(tk, start="2019-12-01", end="2021-06-30"):
+def _series(tk, start="2019-12-01", end="2021-06-30", holidays=()):
     """Deterministic, glitch-free positive price path (no >=5x steps)."""
     idx = pd.bdate_range(start, end, name="Date")
+    if holidays:
+        idx = idx[~idx.isin(pd.to_datetime(list(holidays)))]
     drift = 0.0002 + (sum(map(ord, tk)) % 7) * 0.0001
     return pd.Series(100.0 * np.cumprod(np.full(len(idx), 1 + drift)), index=idx, name=tk)
 
@@ -71,18 +77,25 @@ def _yf_frame(good, failed=()):
 
 
 class FakeYahoo:
-    """Stand-in for yf.download: serves `failing` tickers as placeholders and
-    records every call's ticker list."""
+    """Stand-in for yf.download: serves `failing` tickers as placeholders,
+    lists each ticker from `starts[tk]` (default 2019-12-01), skips `holidays`
+    for every ticker, and records every call's ticker list."""
 
-    def __init__(self, failing=None):
+    def __init__(self, failing=None, starts=None, holidays=()):
         self.failing = dict(failing or {})
+        self.starts = dict(starts or {})
+        self.holidays = tuple(holidays)
         self.calls = []
 
     def __call__(self, tickers, start=None, **kw):
         tickers = list(tickers)
         self.calls.append(tickers)
-        good = {tk: _series(tk)[lambda s: s.index >= pd.Timestamp(start)]
-                for tk in tickers if tk not in self.failing}
+        good = {}
+        for tk in tickers:
+            if tk in self.failing:
+                continue
+            s = _series(tk, start=self.starts.get(tk, "2019-12-01"), holidays=self.holidays)
+            good[tk] = s[s.index >= pd.Timestamp(start)]
         failed = [tk for tk in tickers if tk in self.failing]
         yf.shared._ERRORS = {tk: self.failing[tk] for tk in failed}
         return _yf_frame(good, failed)
@@ -301,6 +314,63 @@ class AppRegressionTest(unittest.TestCase):
         self.assertNotIn("No data after", errors)
         # Shown once; the next Analyze retries instead of every widget rerun.
         self.assertFalse(at.session_state["run_backtest"])
+
+
+class StartDateNoticeTest(unittest.TestCase):
+    """v2.4.2: one notice about the effective start day, naming what decided
+    it. Before, every intermediate step reported itself, so a holiday start
+    pushed to 2020-01-02 AND KMLM's late listing pushing it to 2020-12-02
+    showed up together although only the latter is where the backtest starts."""
+
+    HOLIDAY = ("2020-01-01",)   # the requested start is not a trading day in the fake calendar
+
+    def setUp(self):
+        st.cache_resource.clear()
+
+    def tearDown(self):
+        st.cache_resource.clear()
+
+    def _notices(self, fake):
+        at = AppTest.from_file(APP, default_timeout=120)
+        at.session_state["portfolios_list"] = _two_port_config()
+        at.session_state["sd"] = date(2020, 1, 1)
+        at.session_state["run_backtest"] = True
+        with patch.object(yf, "download", fake):
+            at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual([e.value for e in at.error], [])
+        return ([w.value for w in at.warning if "listed" in w.value or "backtest starts" in w.value]
+                + [i.value for i in at.info if "Aligned" in i.value])
+
+    def test_late_ticker_is_the_only_notice(self):
+        notices = self._notices(FakeYahoo(starts={"KMLM": "2020-12-02"}, holidays=self.HOLIDAY))
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("KMLM", notices[0])
+        self.assertIn("2020-12-02", notices[0])
+        self.assertIn("2020-01-01", notices[0])
+        self.assertNotIn("Aligned", notices[0])
+
+    def test_late_ticker_beats_late_benchmark(self):
+        notices = self._notices(FakeYahoo(starts={"SPY": "2020-06-01", "KMLM": "2020-12-02"},
+                                          holidays=self.HOLIDAY))
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("KMLM", notices[0])
+        self.assertNotIn("SPY", notices[0])
+
+    def test_late_benchmark_alone(self):
+        notices = self._notices(FakeYahoo(starts={"SPY": "2020-06-01"}, holidays=self.HOLIDAY))
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("SPY", notices[0])
+        self.assertIn("2020-06-01", notices[0])
+        self.assertIn("2020-01-01", notices[0])
+
+    def test_holiday_alignment_alone(self):
+        notices = self._notices(FakeYahoo(holidays=self.HOLIDAY))
+        self.assertEqual(notices, ["Aligned to next trading day: 2020-01-02"])
+
+    def test_trading_day_start_with_full_data_is_silent(self):
+        # 2020-01-01 is a weekday, and no holiday in this fake calendar.
+        self.assertEqual(self._notices(FakeYahoo()), [])
 
 
 if __name__ == "__main__":
