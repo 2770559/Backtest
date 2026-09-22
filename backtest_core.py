@@ -162,6 +162,89 @@ def parse_portfolio(port):
     return elem_tickers, elem_weights, errors, composite
 
 
+def _slot_label(tok):
+    """Slot token -> canonical slot label: the cleaned ticker for a singleton,
+    or the cleaned members joined with '+' for a composite "(A, B)". Mirrors
+    the labels parse_portfolio() emits in composite['slot_labels'] and is the
+    key space of per-slot bands (config `slot_bands`)."""
+    tok = str(tok).strip()
+    if tok.startswith('(') and tok.endswith(')'):
+        return "+".join(clean_ticker(x) for x in tok[1:-1].split(',') if x.strip())
+    return clean_ticker(tok)
+
+
+def slot_labels(tickers_str):
+    """Slot labels of a tickers string, in order, independent of the weights
+    field (works for rows whose weights are still invalid). Returns [] when
+    the parentheses are unbalanced."""
+    s = str(tickers_str or '').replace("，", ",").replace("（", "(").replace("）", ")")
+    tokens, err = _split_top_level(s, ',')
+    if err:
+        return []
+    return [_slot_label(t) for t in tokens if t.strip()]
+
+
+def normalize_slot_bands(raw):
+    """Coerce a config `slot_bands` value into {label: {"down": int|None, "up": int|None}}.
+
+    Percent integers; None (or a missing key) means "inherit the portfolio
+    band" for that side. Malformed entries degrade to inherit instead of
+    raising, and entries with neither side set are dropped, so a hand-edited
+    or legacy config can never break loading.
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for label, band in raw.items():
+        if not isinstance(band, dict):
+            continue
+        entry = {}
+        for side in ("down", "up"):
+            v = band.get(side)
+            try:
+                entry[side] = None if v is None or v == "" else int(round(float(v)))
+            except (TypeError, ValueError):
+                entry[side] = None
+        if entry["down"] is None and entry["up"] is None:
+            continue
+        out[str(label).strip()] = entry
+    return out
+
+
+def build_band_thresholds(thr_pct, thr_up_pct, slot_bands, label_to_id):
+    """Translate a portfolio's band config (percent integers) into the engine's
+    (threshold, threshold_up) arguments (fractions).
+
+    thr_pct / thr_up_pct : portfolio-wide DOWN / UP bands in percent
+                           (thr_up_pct None -> same as thr_pct)
+    slot_bands           : {slot_label: {"down": pct|None, "up": pct|None}}
+    label_to_id          : {slot_label: engine slot id} for the slots in this
+                           run (the ticker for singletons, the `groups` value
+                           for composites). Labels absent here are ignored.
+
+    Scalars are returned when no per-slot override applies (the legacy scalar
+    path); otherwise dicts with a "*" default. threshold_up is None whenever it
+    would equal threshold, so a symmetric config takes the pre-2.5.0 code path
+    exactly.
+    """
+    down = float(thr_pct) / 100.0
+    up = float(thr_pct if thr_up_pct is None else thr_up_pct) / 100.0
+    d_over, u_over = {}, {}
+    for label, band in (slot_bands or {}).items():
+        sid = label_to_id.get(label)
+        if sid is None or not isinstance(band, dict):
+            continue
+        if band.get("down") is not None:
+            d_over[sid] = float(band["down"]) / 100.0
+        if band.get("up") is not None:
+            u_over[sid] = float(band["up"]) / 100.0
+    threshold = {"*": down, **d_over} if d_over else down
+    threshold_up = {"*": up, **u_over} if u_over else up
+    if threshold_up == threshold:
+        threshold_up = None
+    return threshold, threshold_up
+
+
 def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
     empty = {"final_nav": "-", "total_ret": "-", "ann_ret": "-", "max_dd": "-", "sharpe": "-", "rebal_cnt": "-",
              "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
@@ -204,26 +287,36 @@ def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
                 "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
 
 
-def apply_local_rebalance(asset_values, target_weights, threshold, return_resets=False):
+def apply_local_rebalance(asset_values, target_weights, threshold, return_resets=False,
+                          threshold_up=None):
     """Local relative-diff rebalance.
 
     Triggered indices are reset to their target weight; the remainder is
     redistributed proportionally to preserve its internal drift.
 
+    threshold    : DOWN band D — scalar, or Series aligned to asset_values.index
+    threshold_up : UP band U, same shapes; None -> U = D (symmetric band).
+    An index triggers when its signed relative deviation d = (w - target)/target
+    is > U or < -D. With U == D this is exactly the pre-2.5.0 test |d| > D:
+    IEEE-754 abs() and negation are exact and division rounds symmetrically
+    about zero, so the symmetric path is bit-identical to the old abs() code.
+
     When return_resets=True, also returns the set of indices that were RESET to
     target (vs only proportionally scaled) — the composite engine uses it to
-    decide which slots restore their default equal split. The math is byte-for-byte
-    the original; the only addition is threading `reset_indices` out. Default
-    False keeps the original single-value return so existing callers are unaffected.
+    decide which slots restore their default equal split. Default False keeps
+    the original single-value return so existing callers are unaffected.
     """
+    if threshold_up is None:
+        threshold_up = threshold
     total_val = asset_values.sum()
     current_vals = asset_values.copy()
     reset_indices = []
     safe_targets = target_weights.replace(0, 1e-9)
     for _ in range(10):
         current_weights = current_vals / total_val
-        rel_diffs = np.abs(current_weights - target_weights) / safe_targets
-        to_trigger = (rel_diffs > threshold) & (~current_vals.index.isin(reset_indices))
+        signed = (current_weights - target_weights) / safe_targets
+        breach = (signed > threshold_up) | (signed < -threshold)
+        to_trigger = breach & (~current_vals.index.isin(reset_indices))
         if not to_trigger.any(): break
         triggered_indices = to_trigger.index[to_trigger].tolist()
         reset_indices.extend(triggered_indices)
@@ -240,8 +333,14 @@ def apply_local_rebalance(asset_values, target_weights, threshold, return_resets
     return (current_vals, set(reset_indices)) if return_resets else current_vals
 
 
+def _empty_stats():
+    return {"sold_total": 0.0, "nav_mean": 0.0, "years": 0.0, "turnover_yr": 0.0,
+            "slot_ids": [], "slot_members": {}, "slot_target": {},
+            "weight_min": {}, "weight_max": {}}
+
+
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
-                          threshold, groups=None):
+                          threshold, groups=None, threshold_up=None, return_stats=False):
     """Backtest one portfolio under one rebalance strategy.
 
     groups: optional element-ticker -> slot-id mapping (dict[str, str]). Elements
@@ -254,17 +353,37 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     groups=None  ==  every column is its own slot  ==  original behaviour,
     bit-identical (singletons short-circuit the unfold; see below).
 
-    threshold: float, or dict {slot_id: thr} for PER-SLOT bands (slot_id = the
-    ticker for singleton slots / the groups value for composites). "*" supplies
-    the default for unlisted slots and is required if any slot is missing.
-    A scalar is broadcast — decisions are bit-identical to the original code.
+    threshold: DOWN band D — float, or dict {slot_id: D, "*": default} for
+    PER-SLOT bands (slot_id = the ticker for singleton slots / the groups value
+    for composites). "*" supplies the default for unlisted slots and is required
+    if any slot is missing. A scalar is broadcast — decisions are bit-identical
+    to the original code. (Keeps its pre-2.5.0 name for compatibility.)
+
+    threshold_up: UP band U, same shapes as threshold; None -> U = D. The RelDiff
+    strategies (Full / Mixed / Local) trigger a slot when its signed relative
+    deviation d = (w - target)/target is > U or < -D. Asymmetric RelDiff keeps its
+    own major/minor multiplier rule on `threshold` alone and ignores threshold_up;
+    Periodic and Buy & Hold ignore both.
+
+    return_stats: when True a 4th value is returned, a dict with turnover and
+    drift statistics:
+      sold_total  : Σ over rebalances of Σ_elements max(0, pre − post value)
+      nav_mean    : mean NAV over the processed bars
+      years       : span of processed bars in years (365.25-day)
+      turnover_yr : sold_total / nav_mean / years  (0 when undefined)
+      slot_ids, slot_members, slot_target : the slot view used for decisions
+      weight_min / weight_max : per-slot aggregate weight extremes over the
+        Init / Hold / Post-Rebal states — i.e. the weights actually carried
+        from one bar to the next (Pre-Rebal breach snapshots are excluded).
     """
     tickers = price_df.columns
-    if price_df.empty: return pd.DataFrame(), 0, {}
+    if price_df.empty:
+        return (pd.DataFrame(), 0, {}, _empty_stats()) if return_stats else (pd.DataFrame(), 0, {})
     start_prices = price_df.iloc[0]
     if start_prices.isna().any():
         start_prices = price_df.bfill().iloc[0]
-        if start_prices.isna().any(): return pd.DataFrame(), 0, {}
+        if start_prices.isna().any():
+            return (pd.DataFrame(), 0, {}, _empty_stats()) if return_stats else (pd.DataFrame(), 0, {})
 
     # Force alignment so groupby/elementwise ops are well-defined (no-op for valid
     # callers, where target_weights is already indexed by price_df.columns).
@@ -281,13 +400,17 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     # Slot-level targets = SUM of member element targets (singleton -> itself).
     slot_targets = target_weights.groupby(slot_of).sum().reindex(slot_ids)
 
-    # Normalize threshold: scalar stays scalar (broadcasts bit-identically);
+    # Normalize bands: scalar stays scalar (broadcasts bit-identically);
     # a dict becomes a Series aligned to slot_ids ("*" = default band).
-    if isinstance(threshold, dict):
-        missing = [s for s in slot_ids if s not in threshold]
-        if missing and "*" not in threshold:
-            raise ValueError(f"threshold dict missing slots {missing} and no '*' default")
-        threshold = pd.Series({s: float(threshold.get(s, threshold.get("*"))) for s in slot_ids})
+    def _band(v, name):
+        if isinstance(v, dict):
+            missing = [s for s in slot_ids if s not in v]
+            if missing and "*" not in v:
+                raise ValueError(f"{name} dict missing slots {missing} and no '*' default")
+            return pd.Series({s: float(v.get(s, v.get("*"))) for s in slot_ids})
+        return v
+    threshold = _band(threshold, "threshold")
+    threshold_up = threshold if threshold_up is None else _band(threshold_up, "threshold_up")
 
     # Per-element initial weights = slot target split EQUALLY among its members.
     member_counts = slot_of.map(slot_of.value_counts())            # aligned to columns
@@ -301,6 +424,16 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
     cumulative_pnl = pd.Series(0.0, index=tickers)                 # PnL stays element-level
     prev_prices = start_prices
+
+    # ---- Stats (read-only observers; they never feed back into the path) ----
+    sold_total = 0.0
+    nav_sum, nav_n = 0.0, 0
+    first_date = last_date = None
+    w_ext = {"min": None, "max": None}
+
+    def _track(slot_w):
+        w_ext["min"] = slot_w if w_ext["min"] is None else np.minimum(w_ext["min"], slot_w)
+        w_ext["max"] = slot_w if w_ext["max"] is None else np.maximum(w_ext["max"], slot_w)
 
     for i in range(len(price_df)):
         current_date = price_df.index[i]
@@ -316,10 +449,16 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         if total_val == 0 or np.isnan(total_val): continue
         current_weights = asset_values / total_val                # element-level weights
 
+        nav_sum += float(total_val); nav_n += 1
+        if first_date is None: first_date = current_date
+        last_date = current_date
+
         if i == 0:
             rec = {"Date": current_date, "Type": "Init", "NAV": total_val}
             rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
-            history.append(rec); continue
+            history.append(rec)
+            _track(asset_values.groupby(slot_of).sum().reindex(slot_ids) / total_val)
+            continue
 
         # ---- FOLD: aggregate elements up to slots for the decision ----
         slot_values = asset_values.groupby(slot_of).sum().reindex(slot_ids)
@@ -350,22 +489,27 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                 new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
 
         elif "RelDiff" in strategy_name:
-            rel_diffs = np.abs(slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
-            # (rel_diffs > threshold).any() == rel_diffs.max() > threshold for a
-            # scalar; the elementwise form also supports per-slot bands.
-            if (rel_diffs > threshold).any():
+            # Signed relative deviation against an UP / DOWN band. With U == D
+            # this is exactly the old |d| > thr test (abs/negation are exact in
+            # IEEE-754 and division rounds symmetrically), so symmetric configs
+            # stay bit-identical; the elementwise form also carries per-slot bands.
+            signed = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
+            breach = (signed > threshold_up) | (signed < -threshold)
+            if breach.any():
                 if strategy_name == STRAT_RD_FULL:
                     new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
                 elif strategy_name == STRAT_RD_MIXED:
-                    if ((slot_targets >= 0.1) & (rel_diffs > threshold)).any():
+                    if ((slot_targets >= 0.1) & breach).any():
                         new_slot_values, reset_slots = total_val * slot_targets, set(slot_ids)
                     else:
                         new_slot_values, reset_slots = apply_local_rebalance(
-                            slot_values, slot_targets, threshold, return_resets=True)
+                            slot_values, slot_targets, threshold, return_resets=True,
+                            threshold_up=threshold_up)
                     do_rebalance = True
                 elif strategy_name == STRAT_RD_LOCAL:
                     new_slot_values, reset_slots = apply_local_rebalance(
-                        slot_values, slot_targets, threshold, return_resets=True)
+                        slot_values, slot_targets, threshold, return_resets=True,
+                        threshold_up=threshold_up)
                     do_rebalance = True
 
         if do_rebalance:
@@ -396,6 +540,10 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                         share = nsv / len(members)
                         for m in members: new_values[m] = share
 
+            # Turnover = money SOLD this bar (element level; buys are the mirror).
+            sold_total += float((asset_values - new_values).clip(lower=0).sum())
+            _track(new_slot_values / total_val)
+
             current_shares, last_rebalance_date = new_values / current_prices, current_date
             post_weights = new_values / total_val
             post_rec = {"Date": current_date, "Type": "Post-Rebal", "NAV": total_val}
@@ -405,13 +553,30 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
             rec = {"Date": current_date, "Type": "Hold", "NAV": total_val}
             rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(rec)
+            _track(slot_weights)
 
     total_pnl = cumulative_pnl.sum()
     pct_pnl = cumulative_pnl / total_pnl if total_pnl != 0 else cumulative_pnl * 0
     pnl_rec = {"Date": "Overall", "Type": "PnL Contrib%", "NAV": float(total_pnl)}
     pnl_rec.update({f"{t}": f"{pct_pnl[t]:.2%}" for t in tickers})
 
-    return pd.DataFrame(history), rebalance_count, pnl_rec
+    if not return_stats:
+        return pd.DataFrame(history), rebalance_count, pnl_rec
+
+    nav_mean = nav_sum / nav_n if nav_n else 0.0
+    years = (last_date - first_date).days / 365.25 if (first_date is not None and last_date is not None) else 0.0
+    stats = {
+        "sold_total": sold_total,
+        "nav_mean": nav_mean,
+        "years": years,
+        "turnover_yr": (sold_total / nav_mean / years) if (nav_mean > 0 and years > 0) else 0.0,
+        "slot_ids": list(slot_ids),
+        "slot_members": {s: list(slot_members[s]) for s in slot_ids},
+        "slot_target": {s: float(slot_targets[s]) for s in slot_ids},
+        "weight_min": {s: float(w_ext["min"][s]) for s in slot_ids} if w_ext["min"] is not None else {},
+        "weight_max": {s: float(w_ext["max"][s]) for s in slot_ids} if w_ext["max"] is not None else {},
+    }
+    return pd.DataFrame(history), rebalance_count, pnl_rec, stats
 
 
 def sample_monthly(final_data):

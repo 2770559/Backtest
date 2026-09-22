@@ -31,12 +31,12 @@ from backtest_core import (
     clean_ticker, parse_portfolio, calculate_metrics,
     run_detailed_backtest, compute_annual_returns,
     scrub_leading_glitches, scrub_isolated_spikes, sample_monthly,
-    _split_top_level,
+    _split_top_level, slot_labels, normalize_slot_bands, build_band_thresholds,
 )
 
 # --- Version ---
-APP_VERSION = "2.4.2"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-09-19"
+APP_VERSION = "2.5.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-21"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -188,6 +188,7 @@ h1, h2, h3, h4 { letter-spacing: -0.02em; }
     border-top: 1px solid var(--border);
 }
 .sum-minis > div { display: flex; justify-content: space-between; gap: 0.5rem; }
+.sum-minis > div.wide { grid-column: 1 / -1; }
 .sum-minis .k { font-size: 0.7rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
 .sum-minis .v { font-size: 0.78rem; color: var(--ink1); font-weight: 600; font-variant-numeric: tabular-nums; }
 .sum-foot {
@@ -328,19 +329,46 @@ DEFAULT_CONFIG_PATH = SAVED_CONFIG_DIR / "_default.json"
 VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL,
                 STRAT_ASYM}
 
+def _norm_band_pct(v, fallback):
+    """Band in percent as an int inside the UI's 1..200 range; non-numeric -> fallback."""
+    try:
+        iv = int(round(float(v)))
+    except (TypeError, ValueError):
+        return fallback
+    return min(200, max(1, iv))
+
+
 def _apply_config_state(loaded_config):
-    """Normalize a config dict into session state (no rerun)."""
+    """Normalize a config dict into session state (no rerun).
+
+    Band fields (v2.5.0): `thr` = DOWN band (legacy name kept), `thr_up` = UP
+    band (missing -> equal to thr, i.e. symmetric), `slot_bands` = per-slot
+    overrides {slot_label: {"down": pct|None, "up": pct|None}}. Old configs
+    therefore load unchanged and run on the engine's legacy scalar path."""
     st.session_state.portfolios_list = loaded_config.get("portfolios", [])
+    band_warns = []
     for p in st.session_state.portfolios_list:
         if 'id' not in p: p['id'] = str(uuid.uuid4())
         p.setdefault('name', 'Port ?')
         p.setdefault('tickers', '')
         p.setdefault('weights', '')
-        p.setdefault('thr', 38)
+        p['thr'] = _norm_band_pct(p.get('thr'), 38)
+        p['thr_up'] = _norm_band_pct(p.get('thr_up'), p['thr'])
+        p['slot_bands'] = normalize_slot_bands(p.get('slot_bands'))
+        known = set(slot_labels(p['tickers']))
+        unknown = [k for k in p['slot_bands'] if k not in known]
+        if unknown:
+            band_warns.append(
+                f"**{p['name']}**: per-slot band(s) for unknown slot(s) **{', '.join(unknown)}** "
+                "— kept in the config but ignored until a matching slot exists (labels: the "
+                "ticker, or a composite's members joined with '+'). Blank them in "
+                "*Per-slot bands* to drop them.")
         if p.get('strat') in STRAT_LEGACY_MAP:
             p['strat'] = STRAT_LEGACY_MAP[p['strat']]
         if p.get('strat') not in VALID_STRATS:
             p['strat'] = STRAT_ASYM
+    if band_warns:
+        st.session_state['_flash_warn'] = band_warns
     st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
     st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
     st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
@@ -353,6 +381,8 @@ def _apply_config_state(loaded_config):
     st.session_state.pop('_alloc_base', None)
     st.session_state.pop('_alloc_pending', None)
     st.session_state.pop('_alloc_pending_seen', None)
+    for _k in (st.session_state.pop('_sb_keys', None) or {}).values():
+        st.session_state.pop(_k, None)      # per-slot band editors: same staleness rule
     _sb_state = st.session_state.get("asset_search")
     if isinstance(_sb_state, dict):  # a stale searchbox pick must not leak in
         _sb_state["result"] = None
@@ -379,7 +409,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
             "strat": STRAT_RD_MIXED,
-            "thr": 40
+            "thr": 40, "thr_up": 40, "slot_bands": {}
         },
         {
             # AV-US with the crypto sleeve as a plain ETH-USD slot (5%), rebalanced
@@ -389,7 +419,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
             "strat": STRAT_ASYM,
-            "thr": 38
+            "thr": 38, "thr_up": 38, "slot_bands": {}
         },
         {
             "id": str(uuid.uuid4()),
@@ -397,7 +427,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "159941.SZ, 512890.SS, 515220.SS, 588080.SS, 518880.SS, 511130.SS",
             "weights": "0.35, 0.15, 0.10, 0.05, 0.15, 0.20",
             "strat": STRAT_RD_MIXED,
-            "thr": 38
+            "thr": 38, "thr_up": 38, "slot_bands": {}
         }
     ]
 
@@ -868,6 +898,92 @@ def flush_alloc_edits():
         return None  # editor-state format drift: skip rather than corrupt
 
 
+# --- Per-slot bands (v2.5.0) -------------------------------------------------
+# Portfolio-level overrides of the Down / Up band for individual slots, stored
+# as port['slot_bands'] = {slot_label: {"down": pct|None, "up": pct|None}}.
+# Each editor is a VIEW over that dict: rows = the portfolio's current slots
+# (plus any stored label that no longer matches a slot, flagged so the user can
+# blank it), rebuilt from the dict on every run and synced straight back. The
+# allocation matrix's Asset column is untouched: the matrix is a cross-portfolio
+# slot view, whereas a band is a per-portfolio attribute.
+ORPHAN_MARK = " ⚠ not in portfolio"
+
+
+def slot_band_rows(port):
+    """Base frame for a portfolio's per-slot band editor (blank = inherit)."""
+    labels = slot_labels(port.get("tickers", ""))
+    bands = port.get("slot_bands") or {}
+    rows = [(l, bands.get(l) or {}) for l in labels]
+    rows += [(l + ORPHAN_MARK, b or {}) for l, b in bands.items() if l not in labels]
+    return pd.DataFrame({
+        "Slot": [r[0] for r in rows],
+        "Down %": pd.Series([r[1].get("down") for r in rows], dtype="float64"),
+        "Up %": pd.Series([r[1].get("up") for r in rows], dtype="float64"),
+    })
+
+
+def sync_slot_bands(df, port):
+    """Editor frame -> port['slot_bands'] in the canonical {"down": x, "up": y}
+    form (None = inherit, same as normalize_slot_bands); a row with both sides
+    blank is dropped."""
+    out = {}
+    for _, row in df.iterrows():
+        lbl = str(row["Slot"]).replace(ORPHAN_MARK, "").strip()
+        entry = {side: (int(row[col]) if pd.notna(row[col]) else None)
+                 for col, side in (("Down %", "down"), ("Up %", "up"))}
+        if lbl and (entry["down"] is not None or entry["up"] is not None):
+            out[lbl] = entry
+    port["slot_bands"] = out
+
+
+def flush_slot_band_edits():
+    """Fold in-flight per-slot band edits into the port dicts. Same rationale
+    as flush_alloc_edits: controls rendered ABOVE the editors (Add, Save
+    Default, the searchbox) would otherwise discard an edit delivered in the
+    same browser event before the editor ever syncs it."""
+    keys = st.session_state.get('_sb_keys') or {}
+    for p in st.session_state.get('portfolios_list', []):
+        key = keys.get(p.get('id'))
+        state = st.session_state.get(key) if key else None
+        if not isinstance(state, dict) or not state.get("edited_rows"):
+            continue
+        try:
+            sync_slot_bands(_merge_editor_state(slot_band_rows(p), state), p)
+        except Exception:
+            pass  # editor-state format drift: skip rather than corrupt
+
+
+def render_slot_band_editors(ports):
+    keys = {}
+    for p in ports:
+        base = slot_band_rows(p)
+        if base.empty:
+            continue
+        # Key changes with the slot set, so a structural change re-anchors the
+        # editor on a fresh base (edits are synced every run, nothing is lost).
+        key = f"sb_{p['id']}_{abs(hash(tuple(base['Slot'])))}"
+        keys[p['id']] = key
+        with st.expander(f"Per-slot bands · {p['name']}", expanded=bool(p.get('slot_bands'))):
+            st.caption(
+                "Override the Down / Up band for individual slots — e.g. keep a volatile "
+                "5% crypto sleeve on a tight 40 / 40 while the core runs 60 / 100. Blank = "
+                "inherit the portfolio band. Composite slots are keyed by their members "
+                "joined with '+'. Applies to the RelDiff strategies only.")
+            edited = st.data_editor(
+                base, key=key, hide_index=True, width="stretch", num_rows="fixed",
+                column_config={
+                    "Slot": st.column_config.TextColumn("Slot", disabled=True, width="medium"),
+                    "Down %": st.column_config.NumberColumn(
+                        "Down %", min_value=1, max_value=200, step=1, format="%d",
+                        help="Trigger when the slot falls below target × (1 − Down %)."),
+                    "Up %": st.column_config.NumberColumn(
+                        "Up %", min_value=1, max_value=200, step=1, format="%d",
+                        help="Trigger when the slot rises above target × (1 + Up %)."),
+                })
+            sync_slot_bands(edited, p)
+    st.session_state['_sb_keys'] = keys
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def yahoo_symbol_search(query):
     """Ticker/fund-name typeahead via Yahoo's symbol-search endpoint.
@@ -928,6 +1044,7 @@ def render_summary_cards(metrics, color_map):
             f'<div><span class="k">Max DD</span><span class="v">{m["max_dd"]}</span></div>'
             f'<div><span class="k">Sharpe</span><span class="v">{m["sharpe"]}</span></div>'
             f'<div><span class="k">Rebal</span><span class="v">{m["rebal_cnt"]}</span></div>'
+            f'<div class="wide"><span class="k">Turnover</span><span class="v">{m.get("turnover", "-")}</span></div>'
             f'</div>'
             f'<div class="sum-foot">{final}</div>'
             f'</div>'
@@ -947,11 +1064,15 @@ def render_comparison_table(metrics, color_map):
     if len(metrics) < 2:
         return
 
+    # (label, display key, raw key, higher_is_better). Max drawdown is stored as a
+    # negative fraction, so "higher" (closer to 0) IS better; turnover is a tax
+    # proxy (California taxable account, HIFO) — lower is better.
     fields = [("Total Return", "total_ret", "_total_ret", True),
               ("Ann. Return", "ann_ret", "_ann_ret", True),
-              ("Max Drawdown", "max_dd", "_max_dd", False),
+              ("Max Drawdown", "max_dd", "_max_dd", True),
               ("Sharpe Ratio", "sharpe", "_sharpe", True),
-              ("Rebalances", "rebal_cnt", None, None)]
+              ("Rebalances", "rebal_cnt", None, None),
+              ("Turnover /yr", "turnover", "_turnover", False)]
 
     header = "<tr><th>Metric</th>"
     for m in metrics:
@@ -968,16 +1089,19 @@ def render_comparison_table(metrics, color_map):
             else:
                 raw_vals.append(None)
 
+        # Best / worst among the series that HAVE a value (the benchmark shows
+        # "-" for turnover; an errored series must not blank the whole row).
+        avail = [v for v in raw_vals if v is not None]
+        best = worst = None
+        if higher_better is not None and len(avail) >= 2:
+            best, worst = (max(avail), min(avail)) if higher_better else (min(avail), max(avail))
+
         for i, m in enumerate(metrics):
-            val = m[key]
+            val = m.get(key, "-")
             cls = ""
-            if higher_better is not None and all(v is not None for v in raw_vals) and len(raw_vals) >= 2:
-                if higher_better:
-                    if raw_vals[i] == max(raw_vals): cls = "best"
-                    elif raw_vals[i] == min(raw_vals): cls = "worst"
-                else:
-                    if raw_vals[i] == max(raw_vals): cls = "best"
-                    elif raw_vals[i] == min(raw_vals): cls = "worst"
+            if raw_vals[i] is not None and best is not None:
+                if raw_vals[i] == best: cls = "best"
+                elif raw_vals[i] == worst: cls = "worst"
             rows += f'<td class="{cls}">{val}</td>'
         rows += "</tr>"
 
@@ -1137,18 +1261,23 @@ strategy_options = [
     STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM
 ]
 
-ROW_SPEC = [0.28, 2.2, 2.6, 1.0, 0.5]
+ROW_SPEC = [0.28, 2.0, 2.4, 0.85, 0.85, 0.5]
+
+for _w in st.session_state.pop('_flash_warn', None) or []:
+    st.warning(_w)
 
 st.markdown('<div class="sec-label">Portfolios</div>', unsafe_allow_html=True)
 with st.container(border=True):
     hdr = st.columns(ROW_SPEC, vertical_alignment="center")
-    for c, lbl in zip(hdr, ["", "Name", "Strategy", "Band %", ""]):
+    for c, lbl in zip(hdr, ["", "Name", "Strategy", "Down %", "Up %", ""]):
         with c:
             if lbl: st.markdown(f'<div class="col-cap">{lbl}</div>', unsafe_allow_html=True)
 
     total_portfolios = len(st.session_state.portfolios_list)
     for i, port in enumerate(st.session_state.portfolios_list):
         if 'id' not in port: port['id'] = str(uuid.uuid4())
+        port.setdefault('thr_up', port['thr'])      # rows injected without the v2.5.0 fields
+        port.setdefault('slot_bands', {})
 
         cols = st.columns(ROW_SPEC, vertical_alignment="center")
         with cols[0]: st.markdown(
@@ -1162,11 +1291,30 @@ with st.container(border=True):
             help="RelDiff Full = any breach resets all · Mixed = major (≥10%) breach resets all, "
                  "else local · Local = only breached slots reset · Asymmetric = minors (<6%) "
                  "trigger at 2.5×↑ / 1.25×↓ the band.")
-        with cols[3]: port['thr'] = st.number_input(
-            "Band %", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed",
-            help="Rebalance trigger band: relative deviation vs target weight, in %. "
-                 "E.g. 40 → a 10% slot triggers beyond 6%–14%.")
-        with cols[4]:
+        with cols[3]: new_thr = st.number_input(
+            "Down %", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed",
+            help="DOWN band D: a slot triggers when its relative deviation vs target drops "
+                 "below −D%, i.e. its weight falls under target × (1 − D). E.g. 60 → a 10% "
+                 "slot triggers below 4%. Asymmetric RelDiff uses this as its single band; "
+                 "Periodic / Buy & Hold ignore it.")
+        # Up follows Down while the band is symmetric (the common case); an Up
+        # value the user set separately stays put when Down changes. The Up
+        # widget is written through session state BEFORE it is instantiated, so
+        # no default is passed on that run (avoids the duplication warning).
+        _tu_key, _tu_default = f"tu_{port['id']}", port['thr_up']
+        if new_thr != port['thr'] and port['thr_up'] == port['thr']:
+            port['thr_up'] = new_thr
+            st.session_state[_tu_key] = new_thr
+            _tu_default = None
+        port['thr'] = new_thr
+        with cols[4]: port['thr_up'] = st.number_input(
+            "Up %", 1, 200, _tu_default, key=_tu_key, label_visibility="collapsed",
+            help="UP band U: a slot triggers when its relative deviation vs target rises "
+                 "above +U%, i.e. its weight exceeds target × (1 + U). E.g. 100 → a 10% slot "
+                 "triggers above 20%. Follows Down % until you set it separately. Ignored by "
+                 "Asymmetric RelDiff / Periodic / Buy & Hold.")
+        if port['thr_up'] is None: port['thr_up'] = port['thr']
+        with cols[5]:
             if total_portfolios > 1:
                 st.button(":material/delete:", key=f"del_{port['id']}",
                           on_click=delete_portfolio, args=(i,), help="Remove this portfolio")
@@ -1177,13 +1325,14 @@ with st.container(border=True):
         if st.button(":material/add_circle: Add", width="stretch",
                      help="Add a portfolio (copies the last one's allocation)."):
             flush_alloc_edits()  # copy must see edits delivered in this same event
+            flush_slot_band_edits()
             ports_now = st.session_state.portfolios_list
             last_port = ports_now[-1] if ports_now else {"tickers": "", "weights": ""}
             ports_now.append({
                 "id": str(uuid.uuid4()),
                 "name": next_port_name(ports_now),
                 "tickers": last_port["tickers"], "weights": last_port["weights"],
-                "strat": STRAT_RD_MIXED, "thr": 40
+                "strat": STRAT_RD_MIXED, "thr": 40, "thr_up": 40, "slot_bands": {}
             })
             st.rerun()
     with act_cols[1]:
@@ -1194,6 +1343,7 @@ with st.container(border=True):
                           "survives cloud redeploys). A confirmation dialog guards against "
                           "accidental clicks and offers reset-to-built-ins."):
             flush_alloc_edits()  # save must include edits delivered in this same event
+            flush_slot_band_edits()
             _errs = validate_inputs(st.session_state.portfolios_list, st.session_state['bi'])
             if _errs:
                 st.error("Default NOT saved — fix first: " + " · ".join(_errs))
@@ -1291,6 +1441,7 @@ with st.container(border=True):
             # Capture any in-flight edits BEFORE the component runs: its
             # per-keystroke internal rerun would otherwise drop them unseen.
             flush_alloc_edits()
+            flush_slot_band_edits()
             sb_cols = st.columns([2.8, 4.2])
             with sb_cols[0]:
                 picked = st_searchbox(
@@ -1336,6 +1487,9 @@ with st.container(border=True):
             sums.append(f'<span style="color:{color};font-weight:600">{p["name"]}: {total:.4g}% {mark}</span>')
         st.markdown('<div class="alloc-sums">' + ' &nbsp;·&nbsp; '.join(sums) + '</div>',
                     unsafe_allow_html=True)
+
+        # --- Per-slot bands (v2.5.0): one collapsible editor per portfolio ---
+        render_slot_band_editors(ports)
 
     btn_cols = st.columns([2, 6])
     with btn_cols[0]:
@@ -1489,6 +1643,7 @@ if st.session_state.run_backtest:
 
         res_list = {}
         valid_ports_meta = {}
+        port_stats, drift_tables = {}, {}
 
         def clean_col(c):
             target = str(c).strip()
@@ -1557,8 +1712,18 @@ if st.session_state.run_backtest:
                     for t in live: groups[t] = f"__slot{si}"
             groups = groups or None
 
-            res_df, cnt, pnl_rec = run_detailed_backtest(
-                p['strat'], price_df[valid_p_tks], w_series, init_f, p['thr']/100.0, groups=groups)
+            # Bands (v2.5.0): slot label -> engine slot id (the ticker for a
+            # singleton, the synthetic id for a composite) so per-slot overrides
+            # reach the engine; symmetric configs collapse to the legacy scalar path.
+            label_to_id = {}
+            for si, live in slot_survivors.items():
+                label_to_id[slots[si][0]] = f"__slot{si}" if len(live) > 1 else live[0]
+            thr_dn, thr_up = build_band_thresholds(
+                p['thr'], p.get('thr_up'), p.get('slot_bands'), label_to_id)
+
+            res_df, cnt, pnl_rec, bt_stats = run_detailed_backtest(
+                p['strat'], price_df[valid_p_tks], w_series, init_f, thr_dn, groups=groups,
+                threshold_up=thr_up, return_stats=True)
             if not res_df.empty:
                 # For each surviving composite slot, add an aggregate weight column.
                 # Element columns keep their OWN ticker name (no slot prefix \u2014 keeps
@@ -1590,6 +1755,26 @@ if st.session_state.run_backtest:
                 df_history = res_df.iloc[::-1].rename(columns=clean_col_p).reset_index(drop=True)
                 df_history['Date'] = pd.to_datetime(df_history['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
                 res_list[p['name']] = pd.concat([pnl_df, df_history], ignore_index=True)
+
+                # Turnover + per-slot weight drift (v2.5.0). The band column shows
+                # the EFFECTIVE Down/Up band per slot for the RelDiff strategies
+                # (Asymmetric RelDiff has its own major/minor rule; Periodic and
+                # Buy & Hold have none).
+                port_stats[p['name']] = bt_stats
+                _band_of = lambda b, sid: (b.get(sid, b.get("*")) if isinstance(b, dict) else b)
+                show_band = p['strat'] in (STRAT_RD_FULL, STRAT_RD_MIXED, STRAT_RD_LOCAL)
+                drift_rows = []
+                for sid in bt_stats["slot_ids"]:
+                    row = {"Slot": "+".join(clean_col(m) for m in bt_stats["slot_members"][sid]),
+                           "Target": bt_stats["slot_target"][sid],
+                           "Min": bt_stats["weight_min"].get(sid),
+                           "Max": bt_stats["weight_max"].get(sid)}
+                    if show_band:
+                        d_eff = _band_of(thr_dn, sid)
+                        u_eff = _band_of(thr_dn if thr_up is None else thr_up, sid)
+                        row["Band"] = f"−{d_eff:.0%} / +{u_eff:.0%}"
+                    drift_rows.append(row)
+                drift_tables[p['name']] = pd.DataFrame(drift_rows)
 
         # --- Inflation Adjustment ---
         if inf_adj:
@@ -1645,10 +1830,14 @@ if st.session_state.run_backtest:
         metrics = []
         bench_m = calculate_metrics(comp_df[f"Benchmark({bench_in})"], 0, risk_free_rate=rf_rate)
         bench_m["name"] = f"Benchmark({bench_in})"
+        bench_m["turnover"], bench_m["_turnover"] = "-", None
         metrics.append(bench_m)
         for p_name, cnt in valid_ports_meta.items():
             m = calculate_metrics(comp_df[p_name], cnt, risk_free_rate=rf_rate)
             m["name"] = p_name
+            _s = port_stats.get(p_name)
+            m["_turnover"] = _s["turnover_yr"] if _s else None
+            m["turnover"] = f"{_s['turnover_yr']:.1%}/yr" if _s else "-"
             metrics.append(m)
 
         # --- Identity colors: keyed to editor ROW INDEX so a series keeps its
@@ -1772,7 +1961,24 @@ if st.session_state.run_backtest:
                 return [''] * len(row)
             for tab, lbl in zip(tabs, tab_names):
                 with tab:
-                    st.caption(f"Start: {actual_start_day.date()}")
+                    _s = port_stats.get(lbl)
+                    cap = f"Start: {actual_start_day.date()}"
+                    if _s:
+                        # Dollar signs are escaped: st.caption renders markdown, where a
+                        # "$...$" pair would be typeset as LaTeX.
+                        cap += (f" · Turnover {_s['turnover_yr']:.1%}/yr = sold \\${_s['sold_total']:,.0f} "
+                                f"÷ mean NAV \\${_s['nav_mean']:,.0f} ÷ {_s['years']:.2f} yrs")
+                    st.caption(cap)
+                    if lbl in drift_tables and not drift_tables[lbl].empty:
+                        st.markdown('<div class="col-cap">Slot weight range · weights carried between '
+                                    'bars (Init / Hold / Post-Rebal)</div>', unsafe_allow_html=True)
+                        _pct_col = lambda name: st.column_config.NumberColumn(name, format="%.2f%%")
+                        st.dataframe(
+                            drift_tables[lbl].assign(**{c: drift_tables[lbl][c] * 100
+                                                        for c in ("Target", "Min", "Max")}),
+                            hide_index=True, width="content",
+                            column_config={"Target": _pct_col("Target"), "Min": _pct_col("Min"),
+                                           "Max": _pct_col("Max")})
                     st.dataframe(res_list[lbl].style.apply(style_row, axis=1).format({"NAV": "{:,.2f}"}), width="stretch")
 
         # --- Annual Returns by Calendar Year ---

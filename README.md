@@ -22,6 +22,7 @@ python3 -m unittest discover -s tests          # 单元测试
 - **Save Default 确认对话框 + 浏览器持久化（v2.4.0）**：点击 Save Default 弹确认对话框防误点（已有默认时显示覆盖警告，并提供「恢复内置默认」按钮）；确认后配置双写 `Backtest/_default.json` **和浏览器 localStorage**（`streamlit-js-eval`）——云端每次重新发布会重建容器抹掉文件，浏览器副本不受影响，新会话自动从中恢复（文件存在时以文件优先）。已保存的默认配置从此在云端重新发布后不再丢失
 - **下载失败不再吞掉整个结果集 + 按标的缓存（v2.4.1）**：修复「删掉 Port C 后 Analyze 只剩 `No data after 2020-01-01`，三组合却正常」。根因（已在 yfinance 1.1.0 真实下载路径上复现）：批量下载中某个标的失败（Yahoo 限流 Too Many Requests、网络抖动、未知代码）时 yfinance 不抛错，而是返回一列零行全空的占位列，且占位列带有复权数据本身没有的 `Adj Close` 层级；应用按整帧优先取 `Adj Close`，结果只剩那一列空数据，所有标的连同基准全部被判为无数据，而这份残缺帧又按「标的集合」缓存了整整一小时——删组合恰好改变了标的集合触发一次新下载并撞上限流，三组合则一直命中旧的完整缓存。修复：价格层级**逐标的**选取，占位列不再影响其他标的；缓存改为**按标的**（增删改组合只补拉新标的）；下载失败的标的单独列出 Yahoo 给出的原因，基准失败直接报错且不缓存、组合内标的失败则从本轮剔除并归一，点 Analyze 即重试；非限流类失败自动重试一次；新增 tests/test_price_fetch.py（含 AppTest 端到端复现）
 - **起始日提示只保留最终生效的一条（v2.4.2）**：此前「Aligned to next trading day: 2020-01-02」和「KMLM listed late (2020-12-02), start date adjusted」会同时出现，而前者描述的日期并不是回测真正的起点。现在先算出最终起点，再只显示决定它的那条：组合内标的晚上市 → 只报该标的（并给出实际起点与设定日）；否则基准晚上市超过 7 天 → 只报基准；否则设定日非交易日 → 只报对齐后的交易日；设定日本身可用则不显示
+- **不对称带宽 + 每槽位带宽 + 换手/漂移指标（v2.5.0）**：再平衡带宽拆成 `Down %`（向下 D）与 `Up %`（向上 U）两列，`Up %` 在对称时跟随 `Down %`、单独改过后独立；每个组合一个「Per-slot bands」折叠区，可对单个槽位（如 5% 加密槽）覆盖 Down/Up（空 = 沿用组合带宽），复合槽以成员 `+` 连接为键；摘要卡与对比表新增 `Turnover`（年换手 = 累计卖出 ÷ 平均 NAV ÷ 年数，基准显示 `-`），明细页新增「槽位权重区间」小表（Init/Hold/Post-Rebal 状态下各槽位的最小/最大权重与生效带宽）。配置 JSON 新增 `thr_up`（缺失 = 等于 `thr`）与 `slot_bands`（缺失 = 空），旧配置加载、导出、Save Default 完全兼容；`thr_up == thr` 且无覆盖时走引擎原路径，结果位级不变（`tests/test_bands.py` 用冻结的 v2.4.0 引擎副本随机矩阵比对）。示例：`Backtest/AV-US 带宽60-100 加密40.json`。研究结论（`AV-US_同期基金分位数_2026-09.md`）：向下带宽决定漂移范围与几乎全部收益差异，向上带宽 60%–150% 影响 ≤0.3 个点；加密槽须单独窄带；趋势覆盖/门控/杠杆经税后测试全部放弃，不进产品
 - **主题感知 UI（v2.1.0）**：亮/暗模式各有一套设计令牌；系列身份色贯穿配置行、摘要卡、图表与表头（色盲安全校验），基准为灰色虚线
 - 数据源 yfinance（复权价，含分红再投资），下载结果**按标的**缓存 1 小时：增删改组合只补拉未缓存的标的；某个标的下载失败只影响它自己，且失败不缓存（点 Analyze 即重试）
 - 配置可导出/导入 JSON；`Backtest/` 目录下的已存配置可在侧边栏直接下拉加载
@@ -34,16 +35,16 @@ python3 -m unittest discover -s tests          # 单元测试
 |---|---|
 | Buy & Hold | 不再平衡 |
 | Periodic (Annual / Semi-Annual) | 每 365 / 180 天再平衡 |
-| RelDiff Full | 任一资产相对偏离 > 阈值时全局重置 |
-| RelDiff Local | 仅触发资产重置到目标权重，其余按比例分摊 |
+| RelDiff Full | 任一槽位触发（`d > U` 或 `d < −D`）时全局重置 |
+| RelDiff Local | 仅触发槽位重置到目标权重，其余按比例分摊（内部迭代重判同样用 U/D） |
 | RelDiff Mixed | 主仓（≥10%）触发时全局重置，否则局部重置 |
-| Asymmetric RelDiff | 主仓（≥6%）对称阈值；小仓上涨 2.5× 阈值 / 下跌 1.25× 阈值非对称触发，任一触发即全局重置 |
+| Asymmetric RelDiff | 主仓（≥6%）对称阈值；小仓上涨 2.5× 阈值 / 下跌 1.25× 阈值非对称触发，任一触发即全局重置。只读 `Down %`（即 `thr`），与 v2.5.0 的 U/D 无关 |
 
 > v2.0.0 移除实验性变体：Asymmetric RelDiff Local 家族（rank/Equal/Prop，v1.4.0 引入）与 RelDiff Mixed (Minor 1.25x/1.5x)（未发布）。历史寻优已定稿 RelDiff Mixed 为生产规则；含被移除策略名的旧配置导入时自动回退为 Asymmetric RelDiff。
 
-相对偏离 = |当前权重 − 目标权重| / 目标权重，阈值 `Thr%` 按百分比输入。带符号相对偏差 =（当前权重 − 目标权重）/ 目标权重，正为超配、负为欠配。
+带符号相对偏差 `d` =（当前权重 − 目标权重）/ 目标权重，正为超配、负为欠配。**向下带宽 D**（`Down %`，JSON `thr`）与**向上带宽 U**（`Up %`，JSON `thr_up`）分开：`d < −D` 或 `d > U` 即触发；`U == D` 时等价于旧版 `|d| > 阈值`。向下最多只能到 −100%，所以 D ≥ 100% 时只剩向上触发。Periodic / Buy & Hold 不受带宽影响。
 
-**分槽位阈值（API 级，v1.5.0）**：`run_detailed_backtest` 的 `threshold` 可传 dict `{slot_id: thr, "*": 默认}`，对不同槽位使用不同触发带（如加密槽窄带、核心槽宽带）。UI 仍为单一 Thr%。标量路径决策逐位不变。
+**分槽位带宽（v1.5.0 API，v2.5.0 进入配置与 UI）**：`run_detailed_backtest(..., threshold=D, threshold_up=U)`，`D`/`U` 各可为标量或 dict `{slot_id: 值, "*": 默认}`（slot_id：单标的槽为代码，复合槽为 `groups` 的值；缺槽位且无 `"*"` 报错），`threshold_up=None` 即 `U = D`。配置层用 `slot_bands: {"槽位标签": {"down": 40, "up": 40}}`（百分比整数，`null` = 沿用组合带宽；标签 = 清洗后的代码，复合槽为成员 `+` 连接，如 `ETH-USD+MSTR`），加载时对不存在的标签给出警告并忽略（保留在配置中，可在编辑器里清空）。`return_stats=True` 额外返回换手与权重区间统计。
 
 ### 聚合标的（Composite Tickers）
 
@@ -83,5 +84,5 @@ backtest_app.py                 # 主应用（UI 层）
 backtest_core.py                # 核心算法（纯函数，无 Streamlit 依赖）
 iran_war_scenario_forecast.py   # 情景预测追踪（独立应用）
 Backtest/                       # 已存回测配置（JSON）
-tests/                          # 单元测试 + AppTest 冒烟测试
+tests/                          # 单元测试 + AppTest 冒烟测试（legacy_engine_v240.py 为冻结引擎参照）
 ```
