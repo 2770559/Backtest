@@ -2,9 +2,15 @@
 
 - Old configs (no thr_up / slot_bands) load with thr_up == thr and no overrides.
 - Unknown slot labels in slot_bands are kept, flagged once, and never crash.
-- Up % follows Down % while symmetric; an independently set Up % stays put.
-- Per-slot band editors sync into port['slot_bands'] and survive an Add click
-  delivered in the same event (flush_slot_band_edits).
+- Up % starts equal to Down % and is independent from then on; the server never
+  writes into the Up widget. The earlier "push Down into Up" follow logic
+  landed while the user was already typing in Up and replaced the digits
+  (reported 2026-09-22); a nullable "empty = mirror" variant was cleared by
+  the frontend on every rerun while empty.
+- Per-slot band editors sync into port['slot_bands'], keep their anchored frame
+  while edits are in flight (a rebuilt frame changes st.data_editor's identity
+  and drops a second quick edit), and survive an Add click delivered in the
+  same event (flush_slot_band_edits).
 - Every stored portfolio carries the new fields (what Export / Save Default write).
 
 No network: the backtest itself is never triggered here.
@@ -13,6 +19,8 @@ import json
 import sys
 import unittest
 from pathlib import Path
+
+import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_DIR))
@@ -44,6 +52,7 @@ class NormBandPctTest(unittest.TestCase):
         self.assertEqual(app._norm_band_pct("60", 38), 60)
         self.assertEqual(app._norm_band_pct(40.4, 38), 40)
         self.assertEqual(app._norm_band_pct(None, 38), 38)
+        self.assertIsNone(app._norm_band_pct(None, None))
         self.assertEqual(app._norm_band_pct("abc", 38), 38)
         self.assertEqual(app._norm_band_pct(999, 38), 200)
         self.assertEqual(app._norm_band_pct(0, 38), 1)
@@ -64,8 +73,22 @@ class OldConfigLoadsSymmetricTest(unittest.TestCase):
         p = _port(at, "Old")
         self.assertEqual((p["thr"], p["thr_up"], p["slot_bands"]), (40, 40, {}))
         self.assertFalse(any("per-slot band" in str(w.value) for w in at.warning))
-        # Up widget shows the inherited value.
+        # Up widget shows the inherited value; the engine gets the symmetric legacy path.
         self.assertEqual(at.number_input(key=f"tu_{p['id']}").value, 40)
+        self.assertEqual(app.build_band_thresholds(p["thr"], p["thr_up"], p["slot_bands"], {}), (0.4, None))
+
+    def test_null_thr_up_loads_as_symmetric(self):
+        at = _load_cfg({
+            "benchmark": "SPY", "start_date": "2020-12-02", "initial_funds": 10000,
+            "portfolios": [{"name": "Nul", "tickers": "QQQM, SPY", "weights": "0.5, 0.5",
+                            "strat": "RelDiff Mixed", "thr": 60, "thr_up": None, "slot_bands": {}},
+                           {"name": "Asym", "tickers": "QQQM, SPY", "weights": "0.5, 0.5",
+                            "strat": "RelDiff Mixed", "thr": 60, "thr_up": 100}],
+        })
+        self.assertFalse(at.exception)
+        self.assertEqual(_port(at, "Nul")["thr_up"], 60)
+        self.assertEqual(_port(at, "Asym")["thr_up"], 100)
+        self.assertEqual(at.number_input(key=f"tu_{_port(at, 'Asym')['id']}").value, 100)
 
 
 class UnknownSlotLabelTest(unittest.TestCase):
@@ -101,21 +124,27 @@ class UnknownSlotLabelTest(unittest.TestCase):
         self.assertEqual(_port(at, "New")["slot_bands"], {"ETH-USD+MSTR": {"down": 40, "up": 40}})
 
 
-class UpFollowsDownTest(unittest.TestCase):
-    def test_up_tracks_down_until_set_independently(self):
+class UpIndependentOfDownTest(unittest.TestCase):
+    def test_down_edits_never_touch_the_up_widget(self):
         at = AppTest.from_file(APP, default_timeout=120).run()
         p = _port(at, "AV-US")
         self.assertEqual((p["thr"], p["thr_up"]), (40, 40))
         tr, tu = f"tr_{p['id']}", f"tu_{p['id']}"
+        self.assertEqual(at.number_input(key=tu).value, 40)
+        up_proto = at.number_input(key=tu).proto.SerializeToString()
 
+        # Changing Down must leave the Up widget untouched: no value pushed
+        # into it (that push replaced digits being typed into Up during the
+        # rerun) and an unchanged proto (a changed proto re-creates the input).
         at.number_input(key=tr).set_value(60)
         at.run()
         self.assertFalse(at.exception)
         p = _port(at, "AV-US")
-        self.assertEqual((p["thr"], p["thr_up"]), (60, 60), "Up must follow Down while symmetric")
-        self.assertEqual(at.number_input(key=tu).value, 60)
-        self.assertFalse(any("Session State API" in str(w.value) for w in at.warning),
-                         "programmatic Up update must not raise the duplication warning")
+        self.assertEqual((p["thr"], p["thr_up"]), (60, 40))
+        self.assertEqual(at.number_input(key=tu).value, 40)
+        self.assertEqual(at.number_input(key=tu).proto.SerializeToString(), up_proto)
+        self.assertFalse(any("Session State API" in str(w.value) for w in at.warning))
+        self.assertEqual(app.build_band_thresholds(60, 40, {}, {}), (0.6, 0.4))
 
         at.number_input(key=tu).set_value(100)
         at.run()
@@ -125,14 +154,14 @@ class UpFollowsDownTest(unittest.TestCase):
         at.run()
         p = _port(at, "AV-US")
         self.assertEqual((p["thr"], p["thr_up"]), (50, 100), "independent Up must not be overwritten")
+        self.assertEqual(app.build_band_thresholds(50, 100, {}, {}), (0.5, 1.0))
 
-        # Setting Up back to Down re-links them.
+        # Equal values are the symmetric band -> legacy engine path.
         at.number_input(key=tu).set_value(50)
         at.run()
-        at.number_input(key=tr).set_value(70)
-        at.run()
         p = _port(at, "AV-US")
-        self.assertEqual((p["thr"], p["thr_up"]), (70, 70))
+        self.assertEqual((p["thr"], p["thr_up"]), (50, 50))
+        self.assertEqual(app.build_band_thresholds(50, 50, {}, {}), (0.5, None))
 
 
 class SlotBandEditorTest(unittest.TestCase):
@@ -174,6 +203,45 @@ class SlotBandEditorTest(unittest.TestCase):
         new = _port(at, "Port D")
         self.assertEqual((new["thr"], new["thr_up"], new["slot_bands"]), (40, 40, {}))
 
+    def test_anchor_frame_is_kept_while_edits_are_in_flight(self):
+        """st.data_editor hashes its data into the widget identity. After the
+        first edit is synced into the dict, re-deriving the frame would move
+        the identity and drop a second edit typed before that rerun landed —
+        so the anchored frame must stay the pre-edit snapshot while the
+        editor holds diffs, and be re-derived only once the diffs are gone."""
+        at = AppTest.from_file(APP, default_timeout=120).run()
+        p = _port(at, "AV-US")
+        key0 = at.session_state["_sb_keys"][p["id"]]
+        anchor0 = at.session_state["_sb_base"][p["id"]][1]
+        row = list(anchor0["Slot"]).index("ETH-USD+MSTR")
+        self.assertTrue(pd.isna(anchor0.loc[row, "Down %"]))
+
+        # First edit committed and synced.
+        at.session_state[key0] = {"edited_rows": {str(row): {"Down %": 40}},
+                                  "added_rows": [], "deleted_rows": []}
+        at.run()
+        self.assertEqual(_port(at, "AV-US")["slot_bands"], {"ETH-USD+MSTR": {"down": 40, "up": None}})
+        key1, anchor1 = at.session_state["_sb_base"][p["id"]]
+        self.assertEqual(key1, key0)
+        self.assertTrue(pd.isna(anchor1.loc[row, "Down %"]), "anchor frame was re-derived mid-edit")
+        self.assertTrue(anchor1.equals(anchor0))
+
+        # Second edit arrives on the SAME editor, accumulated with the first.
+        at.session_state[key0] = {"edited_rows": {str(row): {"Down %": 40, "Up %": 40}},
+                                  "added_rows": [], "deleted_rows": []}
+        at.run()
+        self.assertEqual(_port(at, "AV-US")["slot_bands"], {"ETH-USD+MSTR": {"down": 40, "up": 40}})
+        self.assertTrue(at.session_state["_sb_base"][p["id"]][1].equals(anchor0))
+
+        # Diffs gone (e.g. the searchbox's internal rerun wiped them): the
+        # frame is re-derived from the dict, which already holds both edits.
+        at.session_state[key0] = {"edited_rows": {}, "added_rows": [], "deleted_rows": []}
+        at.run()
+        self.assertFalse(at.exception)
+        anchor2 = at.session_state["_sb_base"][p["id"]][1]
+        self.assertEqual((anchor2.loc[row, "Down %"], anchor2.loc[row, "Up %"]), (40.0, 40.0))
+        self.assertEqual(_port(at, "AV-US")["slot_bands"], {"ETH-USD+MSTR": {"down": 40, "up": 40}})
+
     def test_slot_change_reanchors_editor(self):
         # Removing a slot from the matrix drops its row; the stored override for
         # it is kept (flagged) rather than silently lost.
@@ -192,6 +260,30 @@ class SlotBandEditorTest(unittest.TestCase):
         self.assertNotIn("XLE", p["tickers"].split(", "))
         self.assertEqual(p["slot_bands"], {"XLE": {"down": 20, "up": 20}})
         self.assertIn("XLE" + app.ORPHAN_MARK, list(app.slot_band_rows(p)["Slot"]))
+
+
+class MainAreaStructureTest(unittest.TestCase):
+    """The localStorage bridge components (streamlit_js_eval) are transient:
+    the reader unmounts once the browser has answered. Streamlit keys BLOCKS
+    by their index inside the parent, so a transient element ABOVE the
+    portfolio container re-keys — and re-mounts — that whole container when
+    it disappears, wiping any digits being typed at that moment (the
+    reported first-edit "number jumps away"). They must therefore be the
+    last children of the main area, after every block that holds widgets."""
+
+    def test_bridge_components_render_after_every_block(self):
+        if not app.HAS_JS_EVAL:
+            self.skipTest("streamlit-js-eval not installed")
+        at = AppTest.from_file(APP, default_timeout=120).run()
+        self.assertFalse(at.exception)
+        kinds = [c.type for c in at.main.children.values()]
+        comp_idx = [i for i, k in enumerate(kinds) if k == "component_instance"]
+        block_idx = [i for i, k in enumerate(kinds) if k in ("vertical_block", "flex_container")]
+        self.assertTrue(comp_idx, f"reader component not rendered on a fresh session: {kinds}")
+        self.assertTrue(block_idx, kinds)
+        self.assertGreater(min(comp_idx), max(block_idx),
+                           f"bridge component rendered above a widget block: {kinds}")
+        self.assertEqual(comp_idx[-1], len(kinds) - 1, kinds)
 
 
 class StoredFieldsTest(unittest.TestCase):

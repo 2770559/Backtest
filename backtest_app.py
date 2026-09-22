@@ -35,8 +35,8 @@ from backtest_core import (
 )
 
 # --- Version ---
-APP_VERSION = "2.5.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-09-21"
+APP_VERSION = "2.5.1"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-22"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -330,7 +330,9 @@ VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIX
                 STRAT_ASYM}
 
 def _norm_band_pct(v, fallback):
-    """Band in percent as an int inside the UI's 1..200 range; non-numeric -> fallback."""
+    """Band in percent as an int inside the UI's 1..200 range; None / non-numeric -> fallback."""
+    if v is None:
+        return fallback
     try:
         iv = int(round(float(v)))
     except (TypeError, ValueError):
@@ -342,7 +344,7 @@ def _apply_config_state(loaded_config):
     """Normalize a config dict into session state (no rerun).
 
     Band fields (v2.5.0): `thr` = DOWN band (legacy name kept), `thr_up` = UP
-    band (missing -> equal to thr, i.e. symmetric), `slot_bands` = per-slot
+    band (missing/null -> equal to thr, i.e. symmetric), `slot_bands` = per-slot
     overrides {slot_label: {"down": pct|None, "up": pct|None}}. Old configs
     therefore load unchanged and run on the engine's legacy scalar path."""
     st.session_state.portfolios_list = loaded_config.get("portfolios", [])
@@ -383,6 +385,8 @@ def _apply_config_state(loaded_config):
     st.session_state.pop('_alloc_pending_seen', None)
     for _k in (st.session_state.pop('_sb_keys', None) or {}).values():
         st.session_state.pop(_k, None)      # per-slot band editors: same staleness rule
+    st.session_state.pop('_sb_base', None)
+    st.session_state.pop('_sb_expanded', None)
     _sb_state = st.session_state.get("asset_search")
     if isinstance(_sb_state, dict):  # a stale searchbox pick must not leak in
         _sb_state["result"] = None
@@ -438,13 +442,20 @@ if 'portfolios_list' not in st.session_state:
 # it is restored from there. The file (local workflow) always wins.
 LS_DEFAULT_KEY = "backtest_default_config"
 
+LS_GET_EXPR = f"localStorage.getItem({json.dumps(LS_DEFAULT_KEY)}) ?? '__none__'"
+
 if DEFAULT_CONFIG_PATH.is_file():
     st.session_state['_ls_checked'] = True     # file default already applied
     st.session_state['_ls_default_present'] = True
 if HAS_JS_EVAL and not st.session_state.get('_ls_checked'):
-    _ls_raw = streamlit_js_eval(
-        js_expressions=f"localStorage.getItem({json.dumps(LS_DEFAULT_KEY)}) ?? '__none__'",
-        key="_ls_get")
+    # The reader component itself is rendered at the END of the script (see
+    # the bottom of the file); its answer arrives here through session state
+    # on the following run. Rendering it at the top and dropping it once
+    # answered shifted every main-area element down by one position on the
+    # first user-triggered rerun — the frontend keys elements by position, so
+    # all of them re-mounted and any digits being typed at that moment were
+    # lost (the reported "number jumps away" in the Down % / Up % inputs).
+    _ls_raw = st.session_state.get('_ls_get')
     if _ls_raw == '__none__':
         st.session_state['_ls_checked'] = True
     elif isinstance(_ls_raw, str) and _ls_raw:
@@ -903,9 +914,13 @@ def flush_alloc_edits():
 # as port['slot_bands'] = {slot_label: {"down": pct|None, "up": pct|None}}.
 # Each editor is a VIEW over that dict: rows = the portfolio's current slots
 # (plus any stored label that no longer matches a slot, flagged so the user can
-# blank it), rebuilt from the dict on every run and synced straight back. The
-# allocation matrix's Asset column is untouched: the matrix is a cross-portfolio
-# slot view, whereas a band is a per-portfolio attribute.
+# blank it), synced straight back on every run. The frame the editor is
+# anchored on is a SNAPSHOT kept while edits are in flight: st.data_editor
+# hashes its data into the widget identity, so re-deriving the frame from the
+# freshly synced dict after every cell edit would re-create the editor and
+# drop a second edit typed before that rerun landed. The allocation matrix's
+# Asset column is untouched: the matrix is a cross-portfolio slot view, whereas
+# a band is a per-portfolio attribute.
 ORPHAN_MARK = " ⚠ not in portfolio"
 
 
@@ -955,15 +970,31 @@ def flush_slot_band_edits():
 
 def render_slot_band_editors(ports):
     keys = {}
+    bases = st.session_state.get('_sb_base') or {}
     for p in ports:
-        base = slot_band_rows(p)
-        if base.empty:
+        fresh = slot_band_rows(p)
+        if fresh.empty:
             continue
         # Key changes with the slot set, so a structural change re-anchors the
         # editor on a fresh base (edits are synced every run, nothing is lost).
-        key = f"sb_{p['id']}_{abs(hash(tuple(base['Slot'])))}"
+        key = f"sb_{p['id']}_{abs(hash(tuple(fresh['Slot'])))}"
         keys[p['id']] = key
-        with st.expander(f"Per-slot bands · {p['name']}", expanded=bool(p.get('slot_bands'))):
+        # Keep the anchored frame while the editor holds diffs (its identity
+        # must not move between two quick edits); re-derive it from the dict
+        # otherwise — idempotent, the dict already carries every synced edit.
+        state = st.session_state.get(key)
+        in_flight = isinstance(state, dict) and bool(state.get("edited_rows"))
+        prev = bases.get(p['id'])
+        if prev is None or prev[0] != key or not in_flight:
+            prev = (key, fresh)
+        bases[p['id']] = prev
+        base = prev[1]
+        # `expanded` is decided once per session and portfolio: flipping it after
+        # the first override is synced would re-render the block around the
+        # editor mid-edit. The user's own toggling is client-side and sticks.
+        _exp = st.session_state.setdefault('_sb_expanded', {})
+        with st.expander(f"Per-slot bands · {p['name']}",
+                         expanded=_exp.setdefault(p['id'], bool(p.get('slot_bands')))):
             st.caption(
                 "Override the Down / Up band for individual slots — e.g. keep a volatile "
                 "5% crypto sleeve on a tight 40 / 40 while the core runs 60 / 100. Blank = "
@@ -982,6 +1013,7 @@ def render_slot_band_editors(ports):
                 })
             sync_slot_bands(edited, p)
     st.session_state['_sb_keys'] = keys
+    st.session_state['_sb_base'] = bases
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1291,29 +1323,26 @@ with st.container(border=True):
             help="RelDiff Full = any breach resets all · Mixed = major (≥10%) breach resets all, "
                  "else local · Local = only breached slots reset · Asymmetric = minors (<6%) "
                  "trigger at 2.5×↑ / 1.25×↓ the band.")
-        with cols[3]: new_thr = st.number_input(
+        with cols[3]: port['thr'] = st.number_input(
             "Down %", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed",
             help="DOWN band D: a slot triggers when its relative deviation vs target drops "
                  "below −D%, i.e. its weight falls under target × (1 − D). E.g. 60 → a 10% "
                  "slot triggers below 4%. Asymmetric RelDiff uses this as its single band; "
                  "Periodic / Buy & Hold ignore it.")
-        # Up follows Down while the band is symmetric (the common case); an Up
-        # value the user set separately stays put when Down changes. The Up
-        # widget is written through session state BEFORE it is instantiated, so
-        # no default is passed on that run (avoids the duplication warning).
-        _tu_key, _tu_default = f"tu_{port['id']}", port['thr_up']
-        if new_thr != port['thr'] and port['thr_up'] == port['thr']:
-            port['thr_up'] = new_thr
-            st.session_state[_tu_key] = new_thr
-            _tu_default = None
-        port['thr'] = new_thr
+        # Up % starts equal to Down % when a portfolio is created or loaded and
+        # is independent from then on. It is a plain numeric input exactly like
+        # Down %: the server never writes into it and it is never empty. Two
+        # earlier variants lost digits typed here right after a Down % commit
+        # (a rerun landing mid-typing): pushing the Down value into this widget
+        # through session state replaced them, and a nullable "empty = mirror
+        # Down" input was cleared by the frontend on every rerun while empty.
         with cols[4]: port['thr_up'] = st.number_input(
-            "Up %", 1, 200, _tu_default, key=_tu_key, label_visibility="collapsed",
+            "Up %", 1, 200, port['thr_up'], key=f"tu_{port['id']}", label_visibility="collapsed",
             help="UP band U: a slot triggers when its relative deviation vs target rises "
                  "above +U%, i.e. its weight exceeds target × (1 + U). E.g. 100 → a 10% slot "
-                 "triggers above 20%. Follows Down % until you set it separately. Ignored by "
-                 "Asymmetric RelDiff / Periodic / Buy & Hold.")
-        if port['thr_up'] is None: port['thr_up'] = port['thr']
+                 "triggers above 20%. Starts equal to Down % and is set separately from "
+                 "then on (equal values = the symmetric band). Ignored by Asymmetric "
+                 "RelDiff / Periodic / Buy & Hold.")
         with cols[5]:
             if total_portfolios > 1:
                 st.button(":material/delete:", key=f"del_{port['id']}",
@@ -1505,20 +1534,6 @@ with st.container(border=True):
 
 if _t := st.session_state.pop('_flash_toast', None):
     st.toast(_t, icon="✅")
-
-# localStorage writer: renders while a Save/Reset payload is pending and
-# unmounts once the browser confirms execution (unique nonce per action, so
-# a stale component value can never clear a newer payload prematurely).
-if HAS_JS_EVAL and st.session_state.get('_ls_payload') is not None:
-    _ls_ok = "OK" + st.session_state.get('_ls_nonce', '')
-    if st.session_state['_ls_payload'] == "":
-        _ls_expr = (f"(localStorage.removeItem({json.dumps(LS_DEFAULT_KEY)}), "
-                    f"{json.dumps(_ls_ok)})")
-    else:
-        _ls_expr = (f"(localStorage.setItem({json.dumps(LS_DEFAULT_KEY)}, "
-                    f"{json.dumps(st.session_state['_ls_payload'])}), {json.dumps(_ls_ok)})")
-    if streamlit_js_eval(js_expressions=_ls_expr, key="_ls_set") == _ls_ok:
-        st.session_state.pop('_ls_payload', None)
 
 # Rendered into the sidebar slot AFTER the portfolio section so the exported
 # JSON reflects this run's row edits and matrix sync (not last run's state).
@@ -1995,3 +2010,26 @@ else:
         reinvested; windows ≥ 90 days are sampled at month-end by design.</div>
     </div>
     """, unsafe_allow_html=True)
+
+# --- localStorage bridge components (rendered LAST on purpose) ---------------
+# Both are invisible (CSS above) and transient: the reader shows until the
+# browser has answered, the writer while a Save/Reset payload is pending. An
+# element that appears or disappears shifts the position of everything after
+# it inside the same block, and the frontend re-mounts widgets by position —
+# dropping any input being typed at that moment. At the end of the main area
+# nothing comes after them, so mounting or unmounting them shifts nothing.
+if HAS_JS_EVAL and not st.session_state.get('_ls_checked'):
+    streamlit_js_eval(js_expressions=LS_GET_EXPR, key="_ls_get")   # read at the top of the next run
+
+if HAS_JS_EVAL and st.session_state.get('_ls_payload') is not None:
+    # Unique nonce per action, so a stale component value can never clear a
+    # newer payload prematurely.
+    _ls_ok = "OK" + st.session_state.get('_ls_nonce', '')
+    if st.session_state['_ls_payload'] == "":
+        _ls_expr = (f"(localStorage.removeItem({json.dumps(LS_DEFAULT_KEY)}), "
+                    f"{json.dumps(_ls_ok)})")
+    else:
+        _ls_expr = (f"(localStorage.setItem({json.dumps(LS_DEFAULT_KEY)}, "
+                    f"{json.dumps(st.session_state['_ls_payload'])}), {json.dumps(_ls_ok)})")
+    if streamlit_js_eval(js_expressions=_ls_expr, key="_ls_set") == _ls_ok:
+        st.session_state.pop('_ls_payload', None)
