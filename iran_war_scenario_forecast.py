@@ -424,10 +424,12 @@ def _merge_close_labels(ends, min_gap):
 
 
 def build_chart(df, field, domain, colors, title, tokens, actual=None, actual_name=None,
-                end_labels=None, height=460):
+                end_labels=None, height=460, legend_columns=4):
     """Prediction lines (colored by `field`) + crosshair tooltip, with the actual
     series drawn in the ink color and labeled at its last print.
-    end_labels: {domain value: short text} placed at each line's last point."""
+    end_labels: {domain value: short text} placed at each line's last point.
+    legend_columns: legends don't wrap, so long labels need fewer columns to fit
+    a phone-width chart (~340px)."""
     span_months = (df["日期"].max() - df["日期"].min()).days / DAYS_PER_MONTH
     step = 1 if span_months <= 13 else 2 if span_months <= 26 else 3
     x = alt.X("日期:T", title=None, axis=alt.Axis(
@@ -489,7 +491,7 @@ def build_chart(df, field, domain, colors, title, tokens, actual=None, actual_na
         height=height,
         padding={"left": 5, "top": 5, "right": 40, "bottom": 5},
     ).configure_legend(
-        orient="bottom", columns=4, titleFontSize=12, labelFontSize=11
+        orient="bottom", columns=legend_columns, labelLimit=150, titleFontSize=12, labelFontSize=11
     ).configure_view(strokeWidth=0)
 
 
@@ -607,7 +609,7 @@ section.main > div { max-width: 1400px; margin: 0 auto; }
                 df_p, "情景", scen_names, scen_name_colors,
                 f"AV-US 组合：五情景走势（{actual_word}=实际）", tok,
                 actual=actual[PORT] if actual is not None else None, actual_name=f"实际:{PORT}",
-                end_labels=scen_end_labels, height=440), width="stretch")
+                end_labels=scen_end_labels, height=440, legend_columns=2), width="stretch")
 
         with col_score:
             card = scorecard(actual, offsets)
@@ -714,7 +716,7 @@ section.main > div { max-width: 1400px; margin: 0 auto; }
             df_a, "情景", scen_names, scen_name_colors,
             f"{asset} ({weight_info}) — 五情景走势对比（{actual_word}=实际）", tok,
             actual=actual[asset] if has_actual else None, actual_name=f"实际:{asset}",
-            end_labels=scen_end_labels, height=500), width="stretch")
+            end_labels=scen_end_labels, height=500, legend_columns=2), width="stretch")
 
         with st.expander("📋 查看详细数据表"):
             rows = []
