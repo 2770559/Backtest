@@ -39,7 +39,7 @@ from backtest_core import (
 BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
 
 # --- Version ---
-APP_VERSION = "2.5.2"  # semver: major.minor.patch
+APP_VERSION = "2.5.3"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-09-23"
 
 # --- 1. Page Config ---
@@ -349,6 +349,34 @@ def _norm_band_mode(v):
     anything else or missing -> "rel", the original rule, so pre-2.5.2 configs
     run unchanged."""
     return BAND_MODE_RATIO if str(v or "").strip().lower() == BAND_MODE_RATIO else BAND_MODE_REL
+
+
+def band_trigger_weights(target, down, up, band_mode=BAND_MODE_REL):
+    """Weight levels at which a slot crosses its bands (v2.5.3) — the display
+    side inverse of the engine's trigger test, so the results page can say
+    "triggers below 3.06% / above 51.85%" next to a band of "−40% / +100%".
+
+    target, down, up are fractions. Returns (w_below, w_above); a side is None
+    when it can never trigger: a weight cannot fall below 0 (down >= 100%) or
+    rise above 100%.
+      Δ vs target : w = t·(1 ∓ band)
+      Leg vs rest : w = t·(1 ∓ band) / (1 ∓ t·band)     (g = 1 ∓ band solved for w)
+    Kept in the app (not backtest_core) on purpose: it is presentation only,
+    and a core change would need a Cloud reboot for the cached module.
+    """
+    t = float(target)
+    if not (0.0 < t < 1.0):
+        return None, None
+    d, u = float(down), float(up)
+    if band_mode == BAND_MODE_RATIO:
+        w_dn = t * (1.0 - d) / (1.0 - t * d) if d < 1.0 else None
+        w_up = t * (1.0 + u) / (1.0 + t * u)
+    else:
+        w_dn = t * (1.0 - d) if d < 1.0 else None
+        w_up = t * (1.0 + u)
+    if w_up >= 1.0:
+        w_up = None
+    return w_dn, w_up
 
 
 def _apply_config_state(loaded_config):
@@ -1811,11 +1839,16 @@ if st.session_state.run_backtest:
                 # Turnover + per-slot weight drift (v2.5.0). The band column shows
                 # the EFFECTIVE Down/Up band per slot for the RelDiff strategies
                 # (Asymmetric RelDiff has its own major/minor rule; Periodic and
-                # Buy & Hold have none).
+                # Buy & Hold have none); v2.5.3 adds the weight levels at which
+                # that band is crossed (and, for Leg vs rest, what they amount to
+                # as a Δ vs target band) so Min / Max can be read against them.
                 port_stats[p['name']] = bt_stats
                 _band_of = lambda b, sid: (b.get(sid, b.get("*")) if isinstance(b, dict) else b)
                 show_band = p['strat'] in (STRAT_RD_FULL, STRAT_RD_MIXED, STRAT_RD_LOCAL)
-                band_col = "Band · " + BAND_MODE_LABELS[p.get('band_mode', BAND_MODE_REL)]
+                p_mode = p.get('band_mode', BAND_MODE_REL)
+                band_col = "Band · " + BAND_MODE_LABELS[p_mode]
+                _lvl = lambda w: "never" if w is None else f"{w:.2%}"
+                _dlt = lambda w, t: "—" if w is None else f"{w / t - 1:+.0%}"
                 drift_rows = []
                 for sid in bt_stats["slot_ids"]:
                     row = {"Slot": "+".join(clean_col(m) for m in bt_stats["slot_members"][sid]),
@@ -1826,6 +1859,11 @@ if st.session_state.run_backtest:
                         d_eff = _band_of(thr_dn, sid)
                         u_eff = _band_of(thr_dn if thr_up is None else thr_up, sid)
                         row[band_col] = f"−{d_eff:.0%} / +{u_eff:.0%}"
+                        w_dn, w_up = band_trigger_weights(row["Target"], d_eff, u_eff, p_mode)
+                        row["Trigger <"] = _lvl(w_dn)
+                        row["Trigger >"] = _lvl(w_up)
+                        if p_mode == BAND_MODE_RATIO:
+                            row["Δ equiv."] = f"{_dlt(w_dn, row['Target'])} / {_dlt(w_up, row['Target'])}"
                     drift_rows.append(row)
                 drift_tables[p['name']] = pd.DataFrame(drift_rows)
 
@@ -2023,15 +2061,30 @@ if st.session_state.run_backtest:
                                 f"÷ mean NAV \\${_s['nav_mean']:,.0f} ÷ {_s['years']:.2f} yrs")
                     st.caption(cap)
                     if lbl in drift_tables and not drift_tables[lbl].empty:
+                        _dt = drift_tables[lbl]
+                        _has_trig = "Trigger <" in _dt.columns
                         st.markdown('<div class="col-cap">Slot weight range · weights carried between '
-                                    'bars (Init / Hold / Post-Rebal)</div>', unsafe_allow_html=True)
+                                    'bars (Init / Hold / Post-Rebal)'
+                                    + (' · Trigger = weight at which the band in force is crossed'
+                                       if _has_trig else '') + '</div>', unsafe_allow_html=True)
                         _pct_col = lambda name: st.column_config.NumberColumn(name, format="%.2f%%")
+                        _cfg = {"Target": _pct_col("Target"), "Min": _pct_col("Min"), "Max": _pct_col("Max")}
+                        if _has_trig:
+                            _cfg["Trigger <"] = st.column_config.TextColumn(
+                                "Trigger <", help="The slot triggers once its weight falls below this "
+                                                  "level (never: a DOWN band of 100% or more cannot be "
+                                                  "crossed). Compare with Min.")
+                            _cfg["Trigger >"] = st.column_config.TextColumn(
+                                "Trigger >", help="The slot triggers once its weight rises above this "
+                                                  "level. Compare with Max.")
+                        if "Δ equiv." in _dt.columns:
+                            _cfg["Δ equiv."] = st.column_config.TextColumn(
+                                "Δ equiv.", help="The same trigger levels expressed as a Δ vs target "
+                                                     "band (relative weight deviation, down / up) — what this "
+                                                     "slot's Leg-vs-rest band amounts to under the original rule.")
                         st.dataframe(
-                            drift_tables[lbl].assign(**{c: drift_tables[lbl][c] * 100
-                                                        for c in ("Target", "Min", "Max")}),
-                            hide_index=True, width="content",
-                            column_config={"Target": _pct_col("Target"), "Min": _pct_col("Min"),
-                                           "Max": _pct_col("Max")})
+                            _dt.assign(**{c: _dt[c] * 100 for c in ("Target", "Min", "Max")}),
+                            hide_index=True, width="content", column_config=_cfg)
                     st.dataframe(res_list[lbl].style.apply(style_row, axis=1).format({"NAV": "{:,.2f}"}), width="stretch")
 
         # --- Annual Returns by Calendar Year ---

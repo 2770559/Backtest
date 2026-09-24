@@ -31,6 +31,7 @@ APP = str(APP_DIR / "backtest_app.py")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
 import backtest_app as app  # noqa: E402  (bare-mode import: warnings are harmless)
+from backtest_core import ratio_deviation  # noqa: E402
 
 TMP_CFG = APP_DIR / "Backtest" / "0000_apptest_bands_tmp.json"   # sorts first -> default selection
 
@@ -309,6 +310,49 @@ class NormBandModeTest(unittest.TestCase):
         self.assertEqual(app._norm_band_mode(" RATIO "), "ratio")
         for v in (None, "", "rel", "REL", "garbage", 0, 1, "abs", {"x": 1}):
             self.assertEqual(app._norm_band_mode(v), "rel", v)
+
+
+class BandTriggerWeightsTest(unittest.TestCase):
+    """v2.5.3: the results table's Trigger < / Trigger > levels are the exact
+    inverse of the engine's trigger test in either band mode."""
+
+    def test_rel_mode_levels(self):
+        w_dn, w_up = app.band_trigger_weights(0.10, 0.6, 1.0, "rel")
+        self.assertAlmostEqual(w_dn, 0.04, places=12)          # 10% × (1 − 60%)
+        self.assertAlmostEqual(w_up, 0.20, places=12)          # 10% × (1 + 100%)
+        self.assertEqual(app.band_trigger_weights(0.35, 1.0, 0.6, "rel")[0], None)     # D ≥ 100%: never
+        self.assertAlmostEqual(app.band_trigger_weights(0.35, 1.0, 0.6, "rel")[1], 0.56, places=12)
+        self.assertEqual(app.band_trigger_weights(0.60, 0.4, 1.0, "rel")[1], None)     # 120%: unreachable
+
+    def test_ratio_mode_levels_hand_computed(self):
+        self.assertEqual(app.band_trigger_weights(0.35, 1.0, 1.0, "ratio")[0], None)
+        self.assertAlmostEqual(app.band_trigger_weights(0.35, 1.0, 1.0, "ratio")[1], 0.7 / 1.35, places=12)
+        self.assertAlmostEqual(app.band_trigger_weights(0.10, 1.0, 1.0, "ratio")[1], 0.2 / 1.1, places=12)
+        w_dn, w_up = app.band_trigger_weights(0.05, 0.4, 0.4, "ratio")
+        self.assertAlmostEqual(w_dn, 0.03 / 0.98, places=12)
+        self.assertAlmostEqual(w_up, 0.07 / 1.02, places=12)
+        # Δ vs target equivalents quoted in the README / the reply to the user.
+        self.assertAlmostEqual((0.7 / 1.35) / 0.35 - 1, 0.4815, places=3)
+        self.assertAlmostEqual((0.2 / 1.1) / 0.10 - 1, 0.8182, places=3)
+        self.assertAlmostEqual(w_dn / 0.05 - 1, -0.3878, places=3)
+        self.assertAlmostEqual(w_up / 0.05 - 1, 0.3725, places=3)
+
+    def test_ratio_levels_invert_the_engine_variable(self):
+        # At the level itself the engine reads exactly +U / −D (the strict test
+        # then fires just beyond it).
+        for t in (0.05, 0.10, 0.15, 0.35, 0.65):
+            for d, u in ((0.4, 0.4), (0.5, 1.0), (0.8, 0.8), (0.99, 2.5)):
+                w_dn, w_up = app.band_trigger_weights(t, d, u, "ratio")
+                g_up = ratio_deviation(pd.Series([w_up, 1 - w_up]), pd.Series([t, 1 - t])).iloc[0]
+                g_dn = ratio_deviation(pd.Series([w_dn, 1 - w_dn]), pd.Series([t, 1 - t])).iloc[0]
+                self.assertAlmostEqual(g_up, u, places=10, msg=(t, u))
+                self.assertAlmostEqual(g_dn, -d, places=10, msg=(t, d))
+                self.assertLess(w_dn, t)
+                self.assertGreater(w_up, t)
+
+    def test_degenerate_targets(self):
+        self.assertEqual(app.band_trigger_weights(1.0, 0.4, 0.4, "ratio"), (None, None))
+        self.assertEqual(app.band_trigger_weights(0.0, 0.4, 0.4, "rel"), (None, None))
 
 
 class BandModeConfigTest(unittest.TestCase):
