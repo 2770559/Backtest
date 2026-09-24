@@ -39,8 +39,8 @@ from backtest_core import (
 BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
 
 # --- Version ---
-APP_VERSION = "2.5.3"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-09-23"
+APP_VERSION = "2.5.4"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-24"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -140,6 +140,21 @@ h1, h2, h3, h4 { letter-spacing: -0.02em; }
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+.rb-legend {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin: 0.4rem 0 0.3rem;
+    line-height: 1.6;
+}
+.rb-legend b { color: inherit; font-weight: 600; }
+.rb-sw {
+    display: inline-block;
+    width: 0.8rem; height: 0.8rem;
+    border-radius: 2px;
+    border: 1px solid rgba(0,0,0,0.18);
+    vertical-align: -0.12rem;
+    margin-right: 0.15rem;
 }
 .row-dot {
     display: inline-block;
@@ -377,6 +392,39 @@ def band_trigger_weights(target, down, up, band_mode=BAND_MODE_REL):
     if w_up >= 1.0:
         w_up = None
     return w_dn, w_up
+
+
+# Rebalance-row colours in the detail table (v2.5.4): (Pre-Rebal, Post-Rebal).
+# Global = every slot back to target (orange / green, the pre-2.5.4 colours);
+# Local = only the breached minor slots reset, the rest scaled pro rata (purple).
+# Pastel fills with explicit dark ink, so rows stay readable in the dark theme.
+REBAL_COLORS = {"global": ("#fff3e0", "#e8f5e9"), "local": ("#f3e5f5", "#e1bee7")}
+_INK = "color: #1a1a2e"
+
+
+def rebal_row_style(row, scope=None):
+    """Styler row function for the rebalance detail table. `scope` is the
+    engine's "global" / "local" for the row's rebalance (None when unknown,
+    e.g. a cached pre-2.5.4 engine -> the global colours, as before)."""
+    n = len(row)
+    kind = row.get('Type')
+    if kind == 'PnL Contrib%': return ['background-color: #fce4ec; color: #d81b60; font-weight: bold'] * n
+    if kind == 'Init': return [f'background-color: #e3f2fd; {_INK}; font-weight: bold'] * n
+    pre, post = REBAL_COLORS["local" if scope == "local" else "global"]
+    if kind == 'Pre-Rebal': return [f'background-color: {pre}; {_INK}'] * n
+    if kind == 'Post-Rebal': return [f'background-color: {post}; {_INK}'] * n
+    return [''] * n
+
+
+def rebal_legend_html(n_global, n_local):
+    """Legend line above the detail table: colour swatches + counts per scope."""
+    sw = lambda c: f'<span class="rb-sw" style="background:{c}"></span>'
+    g, l = REBAL_COLORS["global"], REBAL_COLORS["local"]
+    return ('<div class="rb-legend">Rebalance rows · '
+            f'{sw(g[0])}{sw(g[1])}<b>Global {n_global}</b>: every slot back to target '
+            '(RelDiff Mixed: a major slot, target ≥ 10%, breached its band) · '
+            f'{sw(l[0])}{sw(l[1])}<b>Local {n_local}</b>: only minor slots breached · they are reset, '
+            'the other slots scaled pro rata · each pair = Pre-Rebal row, then Post-Rebal row</div>')
 
 
 def _apply_config_state(loaded_config):
@@ -1722,7 +1770,7 @@ if st.session_state.run_backtest:
 
         res_list = {}
         valid_ports_meta = {}
-        port_stats, drift_tables = {}, {}
+        port_stats, drift_tables, rebal_scope = {}, {}, {}
 
         def clean_col(c):
             target = str(c).strip()
@@ -1835,6 +1883,11 @@ if st.session_state.run_backtest:
                 df_history = res_df.iloc[::-1].rename(columns=clean_col_p).reset_index(drop=True)
                 df_history['Date'] = pd.to_datetime(df_history['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
                 res_list[p['name']] = pd.concat([pnl_df, df_history], ignore_index=True)
+                # Rebalance scope per date for the row colours (v2.5.4). .get():
+                # a Cloud container still running a cached pre-2.5.4 engine has
+                # no event log -> uniform colours instead of a crash.
+                rebal_scope[p['name']] = {pd.Timestamp(e["date"]).strftime('%Y-%m-%d'): e["scope"]
+                                          for e in (bt_stats.get("rebal_events") or [])}
 
                 # Turnover + per-slot weight drift (v2.5.0). The band column shows
                 # the EFFECTIVE Down/Up band per slot for the RelDiff strategies
@@ -2043,13 +2096,6 @@ if st.session_state.run_backtest:
             st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
             tab_names = list(res_list.keys())
             tabs = st.tabs(tab_names)
-            def style_row(row):
-                # Explicit dark ink on the pastel fills so rows stay readable in dark theme
-                if row['Type'] == 'PnL Contrib%': return ['background-color: #fce4ec; color: #d81b60; font-weight: bold'] * len(row)
-                if row['Type'] == 'Init': return ['background-color: #e3f2fd; color: #1a1a2e; font-weight: bold'] * len(row)
-                if row['Type'] == 'Pre-Rebal': return ['background-color: #fff3e0; color: #1a1a2e'] * len(row)
-                if row['Type'] == 'Post-Rebal': return ['background-color: #e8f5e9; color: #1a1a2e'] * len(row)
-                return [''] * len(row)
             for tab, lbl in zip(tabs, tab_names):
                 with tab:
                     _s = port_stats.get(lbl)
@@ -2085,7 +2131,12 @@ if st.session_state.run_backtest:
                         st.dataframe(
                             _dt.assign(**{c: _dt[c] * 100 for c in ("Target", "Min", "Max")}),
                             hide_index=True, width="content", column_config=_cfg)
-                    st.dataframe(res_list[lbl].style.apply(style_row, axis=1).format({"NAV": "{:,.2f}"}), width="stretch")
+                    _scope = rebal_scope.get(lbl, {})
+                    if _s and _s.get("rebal_events"):
+                        st.markdown(rebal_legend_html(_s.get("rebal_global", 0), _s.get("rebal_local", 0)),
+                                    unsafe_allow_html=True)
+                    st.dataframe(res_list[lbl].style.apply(lambda r, _sc=_scope: rebal_row_style(r, _sc.get(r.get('Date'))), axis=1)
+                                 .format({"NAV": "{:,.2f}"}), width="stretch")
 
         # --- Annual Returns by Calendar Year ---
         st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)

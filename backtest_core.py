@@ -389,7 +389,8 @@ def apply_local_rebalance(asset_values, target_weights, threshold, return_resets
 def _empty_stats():
     return {"sold_total": 0.0, "nav_mean": 0.0, "years": 0.0, "turnover_yr": 0.0,
             "slot_ids": [], "slot_members": {}, "slot_target": {},
-            "weight_min": {}, "weight_max": {}}
+            "weight_min": {}, "weight_max": {},
+            "rebal_events": [], "rebal_global": 0, "rebal_local": 0}
 
 
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
@@ -437,6 +438,16 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
       weight_min / weight_max : per-slot aggregate weight extremes over the
         Init / Hold / Post-Rebal states — i.e. the weights actually carried
         from one bar to the next (Pre-Rebal breach snapshots are excluded).
+      rebal_events : one dict per rebalance, in order (v2.5.4):
+        {"date": bar date, "scope": "global" | "local", "trigger": [slot ids]}
+        scope "global" = every slot was reset to target (RelDiff Full, Mixed
+        after a major-slot breach, Asymmetric, Periodic, or a local cascade
+        that ended up resetting all slots); "local" = only some slots were
+        reset and the rest scaled pro rata (Mixed after minor-only breaches,
+        Local). trigger = the slots that breached their band on that bar
+        (empty for the time-based Periodic strategies).
+      rebal_global / rebal_local : counts of the two scopes.
+    The history DataFrame and every decision are unchanged by this record.
     """
     _check_band_mode(band_mode)
     tickers = price_df.columns
@@ -491,6 +502,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     # ---- Stats (read-only observers; they never feed back into the path) ----
     sold_total = 0.0
     nav_sum, nav_n = 0.0, 0
+    events = []                                                    # rebalance scope log (v2.5.4)
     first_date = last_date = None
     w_ext = {"min": None, "max": None}
 
@@ -530,6 +542,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         do_rebalance = False
         new_slot_values = slot_values.copy()
         reset_slots = set()                                       # slots restored to default split
+        trig_slots = []                                           # slots that breached (event log only)
 
         # ---- DECISION: EXISTING trigger math, now on slot Series ----
         if strategy_name == STRAT_ANNUAL:
@@ -550,6 +563,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
             if trigger_major.any() or trigger_minor_up.any() or trigger_minor_down.any():
                 new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
+                trig_slots = [sid for sid, f in (trigger_major | trigger_minor_up | trigger_minor_down).items() if f]
 
         elif "RelDiff" in strategy_name:
             # Signed relative deviation against an UP / DOWN band. With U == D
@@ -563,6 +577,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                 signed = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
             breach = (signed > threshold_up) | (signed < -threshold)
             if breach.any():
+                trig_slots = [sid for sid, f in breach.items() if f]
                 if strategy_name == STRAT_RD_FULL:
                     new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
                 elif strategy_name == STRAT_RD_MIXED:
@@ -581,6 +596,9 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
         if do_rebalance:
             rebalance_count += 1
+            events.append({"date": current_date,
+                           "scope": "global" if set(slot_ids) <= set(reset_slots) else "local",
+                           "trigger": trig_slots})
             pre_rec = {"Date": current_date, "Type": "Pre-Rebal", "NAV": total_val}
             pre_rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(pre_rec)
@@ -642,6 +660,9 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         "slot_target": {s: float(slot_targets[s]) for s in slot_ids},
         "weight_min": {s: float(w_ext["min"][s]) for s in slot_ids} if w_ext["min"] is not None else {},
         "weight_max": {s: float(w_ext["max"][s]) for s in slot_ids} if w_ext["max"] is not None else {},
+        "rebal_events": events,
+        "rebal_global": sum(1 for e in events if e["scope"] == "global"),
+        "rebal_local": sum(1 for e in events if e["scope"] == "local"),
     }
     return pd.DataFrame(history), rebalance_count, pnl_rec, stats
 
