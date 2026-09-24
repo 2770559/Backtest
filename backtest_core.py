@@ -26,6 +26,22 @@ STRAT_LEGACY_MAP = {
     "不对称相对差再平衡": STRAT_ASYM,
 }
 
+# Band modes (v2.5.2): how a slot's distance from target is measured before it
+# is compared with the Down / Up band.
+#   "rel"   — relative deviation of the WEIGHT, d = (w − t)/t. The original rule.
+#             Size-biased: a large slot needs a much bigger relative move against
+#             the rest of the portfolio to reach the same d than a small slot does
+#             (a 35% slot must beat the rest by +136% to hit U = 60%, a 10% slot
+#             by +71%).
+#   "ratio" — the slot's cumulative return RELATIVE TO THE REST of the portfolio
+#             since it last stood at target, g = (w/t) / ((1 − w)/(1 − t)), and
+#             the band variable is g − 1. A slot that beats the rest by r ends at
+#             w = t(1+r)/(1+t·r), so g − 1 == r for every target size: the band
+#             means the same thing for a 35% slot and a 10% slot.
+BAND_MODE_REL   = "rel"
+BAND_MODE_RATIO = "ratio"
+BAND_MODES      = (BAND_MODE_REL, BAND_MODE_RATIO)
+
 
 def clean_ticker(t):
     t = t.strip().upper()
@@ -287,8 +303,37 @@ def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
                 "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
 
 
+def _check_band_mode(band_mode):
+    if band_mode not in BAND_MODES:
+        raise ValueError(f"band_mode must be one of {BAND_MODES}, got {band_mode!r}")
+    return band_mode
+
+
+def ratio_deviation(weights, targets):
+    """Size-neutral band variable (band_mode="ratio"), per slot.
+
+    g = (w / t) / ((1 − w) / (1 − t)) is the slot's cumulative return relative to
+    the REST of the portfolio since its weight last stood at target: if the slot
+    beats the rest by r its weight becomes w = t(1+r)/(1+t·r), and that gives
+    g − 1 == r whatever t is. The returned g − 1 is compared with +U / −D exactly
+    like the relative deviation d of the "rel" mode.
+
+    Edge cases: a slot with target ≥ 1 has no rest to measure against and gets
+    0 (never triggers); a slot that has swallowed the whole portfolio while its
+    target is < 1 gets +inf (triggers upward for any U); a slot at zero value
+    gets −1 (triggers for any D < 1), the same as d in "rel" mode.
+    """
+    t = targets.astype(float)
+    w = weights.astype(float)
+    rest_t = 1.0 - t
+    rest_w = 1.0 - w
+    g = (w / t.replace(0, 1e-9)) / (rest_w / rest_t.replace(0, 1e-9))
+    g = g.where(rest_t > 1e-12, 1.0)
+    return g - 1.0
+
+
 def apply_local_rebalance(asset_values, target_weights, threshold, return_resets=False,
-                          threshold_up=None):
+                          threshold_up=None, band_mode=BAND_MODE_REL):
     """Local relative-diff rebalance.
 
     Triggered indices are reset to their target weight; the remainder is
@@ -296,10 +341,14 @@ def apply_local_rebalance(asset_values, target_weights, threshold, return_resets
 
     threshold    : DOWN band D — scalar, or Series aligned to asset_values.index
     threshold_up : UP band U, same shapes; None -> U = D (symmetric band).
-    An index triggers when its signed relative deviation d = (w - target)/target
-    is > U or < -D. With U == D this is exactly the pre-2.5.0 test |d| > D:
-    IEEE-754 abs() and negation are exact and division rounds symmetrically
-    about zero, so the symmetric path is bit-identical to the old abs() code.
+    band_mode    : "rel" (default) — an index triggers when its signed relative
+                   deviation d = (w - target)/target is > U or < -D. With U == D
+                   this is exactly the pre-2.5.0 test |d| > D: IEEE-754 abs() and
+                   negation are exact and division rounds symmetrically about
+                   zero, so the symmetric path is bit-identical to the old abs()
+                   code. "ratio" — the same test on the size-neutral variable
+                   g − 1 of ratio_deviation() (v2.5.2); the "rel" code path is
+                   untouched.
 
     When return_resets=True, also returns the set of indices that were RESET to
     target (vs only proportionally scaled) — the composite engine uses it to
@@ -308,13 +357,17 @@ def apply_local_rebalance(asset_values, target_weights, threshold, return_resets
     """
     if threshold_up is None:
         threshold_up = threshold
+    _check_band_mode(band_mode)
     total_val = asset_values.sum()
     current_vals = asset_values.copy()
     reset_indices = []
     safe_targets = target_weights.replace(0, 1e-9)
     for _ in range(10):
         current_weights = current_vals / total_val
-        signed = (current_weights - target_weights) / safe_targets
+        if band_mode == BAND_MODE_RATIO:
+            signed = ratio_deviation(current_weights, target_weights)
+        else:
+            signed = (current_weights - target_weights) / safe_targets
         breach = (signed > threshold_up) | (signed < -threshold)
         to_trigger = breach & (~current_vals.index.isin(reset_indices))
         if not to_trigger.any(): break
@@ -340,7 +393,8 @@ def _empty_stats():
 
 
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
-                          threshold, groups=None, threshold_up=None, return_stats=False):
+                          threshold, groups=None, threshold_up=None, return_stats=False,
+                          band_mode=BAND_MODE_REL):
     """Backtest one portfolio under one rebalance strategy.
 
     groups: optional element-ticker -> slot-id mapping (dict[str, str]). Elements
@@ -365,6 +419,14 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     own major/minor multiplier rule on `threshold` alone and ignores threshold_up;
     Periodic and Buy & Hold ignore both.
 
+    band_mode (v2.5.2): "rel" (default) measures d as above — the original,
+    bit-identical rule. "ratio" replaces d by the size-neutral g − 1 of
+    ratio_deviation(): the slot's cumulative return relative to the rest of the
+    portfolio since its last reset, so U / D mean the same for every slot size
+    (U = 100% = "the slot doubled against the rest", D = 50% = "it halved").
+    Per-slot bands are read in the same mode. Only the RelDiff strategies use it;
+    Asymmetric RelDiff, Periodic and Buy & Hold ignore it.
+
     return_stats: when True a 4th value is returned, a dict with turnover and
     drift statistics:
       sold_total  : Σ over rebalances of Σ_elements max(0, pre − post value)
@@ -376,6 +438,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         Init / Hold / Post-Rebal states — i.e. the weights actually carried
         from one bar to the next (Pre-Rebal breach snapshots are excluded).
     """
+    _check_band_mode(band_mode)
     tickers = price_df.columns
     if price_df.empty:
         return (pd.DataFrame(), 0, {}, _empty_stats()) if return_stats else (pd.DataFrame(), 0, {})
@@ -493,7 +556,11 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
             # this is exactly the old |d| > thr test (abs/negation are exact in
             # IEEE-754 and division rounds symmetrically), so symmetric configs
             # stay bit-identical; the elementwise form also carries per-slot bands.
-            signed = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
+            # band_mode="ratio" swaps d for the size-neutral g − 1 (v2.5.2).
+            if band_mode == BAND_MODE_RATIO:
+                signed = ratio_deviation(slot_weights, slot_targets)
+            else:
+                signed = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
             breach = (signed > threshold_up) | (signed < -threshold)
             if breach.any():
                 if strategy_name == STRAT_RD_FULL:
@@ -504,12 +571,12 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                     else:
                         new_slot_values, reset_slots = apply_local_rebalance(
                             slot_values, slot_targets, threshold, return_resets=True,
-                            threshold_up=threshold_up)
+                            threshold_up=threshold_up, band_mode=band_mode)
                     do_rebalance = True
                 elif strategy_name == STRAT_RD_LOCAL:
                     new_slot_values, reset_slots = apply_local_rebalance(
                         slot_values, slot_targets, threshold, return_resets=True,
-                        threshold_up=threshold_up)
+                        threshold_up=threshold_up, band_mode=band_mode)
                     do_rebalance = True
 
         if do_rebalance:

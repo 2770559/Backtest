@@ -32,11 +32,15 @@ from backtest_core import (
     run_detailed_backtest, compute_annual_returns,
     scrub_leading_glitches, scrub_isolated_spikes, sample_monthly,
     _split_top_level, slot_labels, normalize_slot_bands, build_band_thresholds,
+    BAND_MODE_REL, BAND_MODE_RATIO, BAND_MODES,
 )
 
+# Band mode (v2.5.2) as shown in the portfolio row: what Down % / Up % measure.
+BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
+
 # --- Version ---
-APP_VERSION = "2.5.1"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-09-22"
+APP_VERSION = "2.5.2"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-23"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -340,13 +344,21 @@ def _norm_band_pct(v, fallback):
     return min(200, max(1, iv))
 
 
+def _norm_band_mode(v):
+    """Band mode from a config value: "ratio" (any case / padding) or "rel";
+    anything else or missing -> "rel", the original rule, so pre-2.5.2 configs
+    run unchanged."""
+    return BAND_MODE_RATIO if str(v or "").strip().lower() == BAND_MODE_RATIO else BAND_MODE_REL
+
+
 def _apply_config_state(loaded_config):
     """Normalize a config dict into session state (no rerun).
 
     Band fields (v2.5.0): `thr` = DOWN band (legacy name kept), `thr_up` = UP
     band (missing/null -> equal to thr, i.e. symmetric), `slot_bands` = per-slot
-    overrides {slot_label: {"down": pct|None, "up": pct|None}}. Old configs
-    therefore load unchanged and run on the engine's legacy scalar path."""
+    overrides {slot_label: {"down": pct|None, "up": pct|None}}. v2.5.2 adds
+    `band_mode` ("rel" | "ratio", missing -> "rel"). Old configs therefore load
+    unchanged and run on the engine's legacy scalar path."""
     st.session_state.portfolios_list = loaded_config.get("portfolios", [])
     band_warns = []
     for p in st.session_state.portfolios_list:
@@ -357,6 +369,7 @@ def _apply_config_state(loaded_config):
         p['thr'] = _norm_band_pct(p.get('thr'), 38)
         p['thr_up'] = _norm_band_pct(p.get('thr_up'), p['thr'])
         p['slot_bands'] = normalize_slot_bands(p.get('slot_bands'))
+        p['band_mode'] = _norm_band_mode(p.get('band_mode'))
         known = set(slot_labels(p['tickers']))
         unknown = [k for k in p['slot_bands'] if k not in known]
         if unknown:
@@ -413,7 +426,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
             "strat": STRAT_RD_MIXED,
-            "thr": 40, "thr_up": 40, "slot_bands": {}
+            "thr": 40, "thr_up": 40, "slot_bands": {}, "band_mode": BAND_MODE_REL
         },
         {
             # AV-US with the crypto sleeve as a plain ETH-USD slot (5%), rebalanced
@@ -423,7 +436,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, ETH-USD",
             "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
             "strat": STRAT_ASYM,
-            "thr": 38, "thr_up": 38, "slot_bands": {}
+            "thr": 38, "thr_up": 38, "slot_bands": {}, "band_mode": BAND_MODE_REL
         },
         {
             "id": str(uuid.uuid4()),
@@ -431,7 +444,7 @@ if 'portfolios_list' not in st.session_state:
             "tickers": "159941.SZ, 512890.SS, 515220.SS, 588080.SS, 518880.SS, 511130.SS",
             "weights": "0.35, 0.15, 0.10, 0.05, 0.15, 0.20",
             "strat": STRAT_RD_MIXED,
-            "thr": 38, "thr_up": 38, "slot_bands": {}
+            "thr": 38, "thr_up": 38, "slot_bands": {}, "band_mode": BAND_MODE_REL
         }
     ]
 
@@ -999,17 +1012,22 @@ def render_slot_band_editors(ports):
                 "Override the Down / Up band for individual slots — e.g. keep a volatile "
                 "5% crypto sleeve on a tight 40 / 40 while the core runs 60 / 100. Blank = "
                 "inherit the portfolio band. Composite slots are keyed by their members "
-                "joined with '+'. Applies to the RelDiff strategies only.")
+                "joined with '+'. Read in the portfolio's band mode (Δ vs target / Leg vs "
+                "rest). Applies to the RelDiff strategies only.")
             edited = st.data_editor(
                 base, key=key, hide_index=True, width="stretch", num_rows="fixed",
                 column_config={
                     "Slot": st.column_config.TextColumn("Slot", disabled=True, width="medium"),
                     "Down %": st.column_config.NumberColumn(
                         "Down %", min_value=1, max_value=200, step=1, format="%d",
-                        help="Trigger when the slot falls below target × (1 − Down %)."),
+                        help="Δ vs target: trigger when the slot falls below target × (1 − Down %). "
+                             "Leg vs rest: when it has lost Down % against the rest of the "
+                             "portfolio since its last reset."),
                     "Up %": st.column_config.NumberColumn(
                         "Up %", min_value=1, max_value=200, step=1, format="%d",
-                        help="Trigger when the slot rises above target × (1 + Up %)."),
+                        help="Δ vs target: trigger when the slot rises above target × (1 + Up %). "
+                             "Leg vs rest: when it has gained Up % against the rest of the "
+                             "portfolio since its last reset."),
                 })
             sync_slot_bands(edited, p)
     st.session_state['_sb_keys'] = keys
@@ -1293,7 +1311,7 @@ strategy_options = [
     STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM
 ]
 
-ROW_SPEC = [0.28, 2.0, 2.4, 0.85, 0.85, 0.5]
+ROW_SPEC = [0.28, 1.9, 2.2, 0.8, 0.8, 1.25, 0.5]
 
 for _w in st.session_state.pop('_flash_warn', None) or []:
     st.warning(_w)
@@ -1301,7 +1319,7 @@ for _w in st.session_state.pop('_flash_warn', None) or []:
 st.markdown('<div class="sec-label">Portfolios</div>', unsafe_allow_html=True)
 with st.container(border=True):
     hdr = st.columns(ROW_SPEC, vertical_alignment="center")
-    for c, lbl in zip(hdr, ["", "Name", "Strategy", "Down %", "Up %", ""]):
+    for c, lbl in zip(hdr, ["", "Name", "Strategy", "Down %", "Up %", "Band", ""]):
         with c:
             if lbl: st.markdown(f'<div class="col-cap">{lbl}</div>', unsafe_allow_html=True)
 
@@ -1310,6 +1328,7 @@ with st.container(border=True):
         if 'id' not in port: port['id'] = str(uuid.uuid4())
         port.setdefault('thr_up', port['thr'])      # rows injected without the v2.5.0 fields
         port.setdefault('slot_bands', {})
+        port.setdefault('band_mode', BAND_MODE_REL)  # ... or the v2.5.2 field
 
         cols = st.columns(ROW_SPEC, vertical_alignment="center")
         with cols[0]: st.markdown(
@@ -1325,10 +1344,12 @@ with st.container(border=True):
                  "trigger at 2.5×↑ / 1.25×↓ the band.")
         with cols[3]: port['thr'] = st.number_input(
             "Down %", 1, 200, port['thr'], key=f"tr_{port['id']}", label_visibility="collapsed",
-            help="DOWN band D: a slot triggers when its relative deviation vs target drops "
-                 "below −D%, i.e. its weight falls under target × (1 − D). E.g. 60 → a 10% "
-                 "slot triggers below 4%. Asymmetric RelDiff uses this as its single band; "
-                 "Periodic / Buy & Hold ignore it.")
+            help="DOWN band D. Δ vs target: a slot triggers when its relative deviation vs "
+                 "target drops below −D%, i.e. its weight falls under target × (1 − D); e.g. 60 "
+                 "→ a 10% slot triggers below 4%. Leg vs rest: it triggers once it has lost D% "
+                 "against the rest of the portfolio since its last reset (50 → it halved). "
+                 "Asymmetric RelDiff uses this as its single band; Periodic / Buy & Hold "
+                 "ignore it.")
         # Up % starts equal to Down % when a portfolio is created or loaded and
         # is independent from then on. It is a plain numeric input exactly like
         # Down %: the server never writes into it and it is never empty. Two
@@ -1338,12 +1359,27 @@ with st.container(border=True):
         # Down" input was cleared by the frontend on every rerun while empty.
         with cols[4]: port['thr_up'] = st.number_input(
             "Up %", 1, 200, port['thr_up'], key=f"tu_{port['id']}", label_visibility="collapsed",
-            help="UP band U: a slot triggers when its relative deviation vs target rises "
-                 "above +U%, i.e. its weight exceeds target × (1 + U). E.g. 100 → a 10% slot "
-                 "triggers above 20%. Starts equal to Down % and is set separately from "
-                 "then on (equal values = the symmetric band). Ignored by Asymmetric "
-                 "RelDiff / Periodic / Buy & Hold.")
-        with cols[5]:
+            help="UP band U. Δ vs target: a slot triggers when its relative deviation vs "
+                 "target rises above +U%, i.e. its weight exceeds target × (1 + U); e.g. 100 → "
+                 "a 10% slot triggers above 20%. Leg vs rest: it triggers once it has gained "
+                 "U% against the rest of the portfolio since its last reset (100 → it "
+                 "doubled). Starts equal to Down % and is set separately from then on (equal "
+                 "values = the symmetric band). Ignored by Asymmetric RelDiff / Periodic / "
+                 "Buy & Hold.")
+        # Band mode (v2.5.2): what the two bands measure. A plain selectbox like
+        # Strategy — the server never writes into it.
+        with cols[5]: port['band_mode'] = st.selectbox(
+            "Band", list(BAND_MODES), index=list(BAND_MODES).index(port['band_mode']),
+            format_func=BAND_MODE_LABELS.get, key=f"bm_{port['id']}", label_visibility="collapsed",
+            help="What Down % / Up % measure. **Δ vs target** — the original rule: the slot's "
+                 "relative weight deviation (w − target) / target. It is size-biased: a 35% slot "
+                 "must beat the rest of the portfolio by +136% to reach U = 60, a 10% slot only "
+                 "by +71%. **Leg vs rest** (v2.5.2, size-neutral): the slot's cumulative return "
+                 "relative to the rest of the portfolio since its last reset, g = (w/t) / "
+                 "((1−w)/(1−t)) − 1; U = 100 → the slot doubled against the rest, D = 50 → it "
+                 "halved, whatever its size. Per-slot bands are read in the same mode. RelDiff "
+                 "strategies only; Asymmetric RelDiff / Periodic / Buy & Hold ignore it.")
+        with cols[6]:
             if total_portfolios > 1:
                 st.button(":material/delete:", key=f"del_{port['id']}",
                           on_click=delete_portfolio, args=(i,), help="Remove this portfolio")
@@ -1361,7 +1397,7 @@ with st.container(border=True):
                 "id": str(uuid.uuid4()),
                 "name": next_port_name(ports_now),
                 "tickers": last_port["tickers"], "weights": last_port["weights"],
-                "strat": STRAT_RD_MIXED, "thr": 40, "thr_up": 40, "slot_bands": {}
+                "strat": STRAT_RD_MIXED, "thr": 40, "thr_up": 40, "slot_bands": {}, "band_mode": BAND_MODE_REL
             })
             st.rerun()
     with act_cols[1]:
@@ -1738,7 +1774,8 @@ if st.session_state.run_backtest:
 
             res_df, cnt, pnl_rec, bt_stats = run_detailed_backtest(
                 p['strat'], price_df[valid_p_tks], w_series, init_f, thr_dn, groups=groups,
-                threshold_up=thr_up, return_stats=True)
+                threshold_up=thr_up, return_stats=True,
+                band_mode=p.get('band_mode', BAND_MODE_REL))
             if not res_df.empty:
                 # For each surviving composite slot, add an aggregate weight column.
                 # Element columns keep their OWN ticker name (no slot prefix \u2014 keeps
@@ -1778,6 +1815,7 @@ if st.session_state.run_backtest:
                 port_stats[p['name']] = bt_stats
                 _band_of = lambda b, sid: (b.get(sid, b.get("*")) if isinstance(b, dict) else b)
                 show_band = p['strat'] in (STRAT_RD_FULL, STRAT_RD_MIXED, STRAT_RD_LOCAL)
+                band_col = "Band · " + BAND_MODE_LABELS[p.get('band_mode', BAND_MODE_REL)]
                 drift_rows = []
                 for sid in bt_stats["slot_ids"]:
                     row = {"Slot": "+".join(clean_col(m) for m in bt_stats["slot_members"][sid]),
@@ -1787,7 +1825,7 @@ if st.session_state.run_backtest:
                     if show_band:
                         d_eff = _band_of(thr_dn, sid)
                         u_eff = _band_of(thr_dn if thr_up is None else thr_up, sid)
-                        row["Band"] = f"−{d_eff:.0%} / +{u_eff:.0%}"
+                        row[band_col] = f"−{d_eff:.0%} / +{u_eff:.0%}"
                     drift_rows.append(row)
                 drift_tables[p['name']] = pd.DataFrame(drift_rows)
 

@@ -1,0 +1,55 @@
+{
+  "benchmark": "SPY",
+  "start_date": "2020-12-02",
+  "initial_funds": 10000,
+  "portfolios": [
+    {
+      "id": "avus-ratio-100-100-crypto40-2026-09",
+      "name": "AV-US leg÷rest 100/100 · crypto 40/40",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
+      "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
+      "strat": "RelDiff Mixed",
+      "thr": 100,
+      "thr_up": 100,
+      "slot_bands": {
+        "ETH-USD+MSTR": {
+          "down": 40,
+          "up": 40
+        }
+      },
+      "band_mode": "ratio"
+    },
+    {
+      "id": "avus-ratio-80-80-crypto40-2026-09",
+      "name": "AV-US leg÷rest 80/80 · crypto 40/40",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
+      "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
+      "strat": "RelDiff Mixed",
+      "thr": 80,
+      "thr_up": 80,
+      "slot_bands": {
+        "ETH-USD+MSTR": {
+          "down": 40,
+          "up": 40
+        }
+      },
+      "band_mode": "ratio"
+    },
+    {
+      "id": "avus-rel-60-100-crypto40-2026-09",
+      "name": "AV-US Δ 60/100 · crypto 40/40",
+      "tickers": "QQQM, BRK.B, GLDM, XLE, DBMF, KMLM, (ETH-USD, MSTR)",
+      "weights": "0.35, 0.15, 0.15, 0.10, 0.10, 0.10, 0.05",
+      "strat": "RelDiff Mixed",
+      "thr": 60,
+      "thr_up": 100,
+      "slot_bands": {
+        "ETH-USD+MSTR": {
+          "down": 40,
+          "up": 40
+        }
+      },
+      "band_mode": "rel"
+    }
+  ]
+}

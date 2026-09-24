@@ -12,6 +12,8 @@
   and drops a second quick edit), and survive an Add click delivered in the
   same event (flush_slot_band_edits).
 - Every stored portfolio carries the new fields (what Export / Save Default write).
+- v2.5.2 band mode: `band_mode` loads as "ratio" or falls back to "rel" (missing
+  or unknown values), the row selectbox shows and edits it, built-ins are "rel".
 
 No network: the backtest itself is never triggered here.
 """
@@ -293,9 +295,71 @@ class StoredFieldsTest(unittest.TestCase):
             self.assertIn("thr_up", p)
             self.assertIn("slot_bands", p)
             self.assertEqual(p["thr_up"], p["thr"])      # built-ins are symmetric
+            self.assertEqual(p["band_mode"], "rel")      # built-ins run the original rule
+            self.assertEqual(at.selectbox(key=f"bm_{p['id']}").value, "rel")
         # Export / Save Default serialize this list verbatim.
         payload = json.loads(json.dumps(at.session_state["portfolios_list"]))
-        self.assertTrue(all("thr_up" in p and "slot_bands" in p for p in payload))
+        self.assertTrue(all("thr_up" in p and "slot_bands" in p and p["band_mode"] == "rel"
+                            for p in payload))
+
+
+class NormBandModeTest(unittest.TestCase):
+    def test_coercion(self):
+        self.assertEqual(app._norm_band_mode("ratio"), "ratio")
+        self.assertEqual(app._norm_band_mode(" RATIO "), "ratio")
+        for v in (None, "", "rel", "REL", "garbage", 0, 1, "abs", {"x": 1}):
+            self.assertEqual(app._norm_band_mode(v), "rel", v)
+
+
+class BandModeConfigTest(unittest.TestCase):
+    """band_mode round-trips through Load / the row selectbox / the stored dict."""
+
+    CFG = {
+        "benchmark": "SPY", "start_date": "2020-12-02", "initial_funds": 10000,
+        "portfolios": [
+            {"name": "Ratio", "tickers": "QQQM, BRK.B, (ETH-USD, MSTR)", "weights": "0.6, 0.35, 0.05",
+             "strat": "RelDiff Mixed", "thr": 100, "thr_up": 100,
+             "slot_bands": {"ETH-USD+MSTR": {"down": 40, "up": 40}}, "band_mode": "ratio"},
+            {"name": "Bad", "tickers": "QQQM, SPY", "weights": "0.5, 0.5",
+             "strat": "RelDiff Full", "thr": 40, "band_mode": "abs"},
+            {"name": "Old", "tickers": "QQQM, SPY", "weights": "0.5, 0.5",
+             "strat": "RelDiff Full", "thr": 40},
+        ],
+    }
+
+    def tearDown(self):
+        TMP_CFG.unlink(missing_ok=True)
+
+    def test_load_shows_and_keeps_mode(self):
+        at = _load_cfg(self.CFG)
+        self.assertFalse(at.exception)
+        ratio, bad, old = (_port(at, n) for n in ("Ratio", "Bad", "Old"))
+        self.assertEqual(ratio["band_mode"], "ratio")
+        self.assertEqual(bad["band_mode"], "rel")           # unknown value -> original rule
+        self.assertEqual(old["band_mode"], "rel")           # pre-2.5.2 config -> original rule
+        self.assertEqual(at.selectbox(key=f"bm_{ratio['id']}").value, "ratio")
+        self.assertEqual(at.selectbox(key=f"bm_{old['id']}").value, "rel")
+        # The row selectbox shows the human labels, in engine order.
+        self.assertEqual(at.selectbox(key=f"bm_{ratio['id']}").options, ["Δ vs target", "Leg vs rest"])
+        # The per-slot override is untouched by the mode.
+        self.assertEqual(ratio["slot_bands"], {"ETH-USD+MSTR": {"down": 40, "up": 40}})
+        # Export serializes the field.
+        payload = json.loads(json.dumps(at.session_state["portfolios_list"]))
+        self.assertEqual([p["band_mode"] for p in payload], ["ratio", "rel", "rel"])
+
+    def test_selectbox_edits_the_stored_dict(self):
+        at = _load_cfg(self.CFG)
+        old = _port(at, "Old")
+        at.selectbox(key=f"bm_{old['id']}").select("ratio")
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual(_port(at, "Old")["band_mode"], "ratio")
+        ratio = _port(at, "Ratio")
+        at.selectbox(key=f"bm_{ratio['id']}").select("rel")
+        at.run()
+        self.assertEqual(_port(at, "Ratio")["band_mode"], "rel")
+        # Down / Up rows are untouched by the mode switch.
+        self.assertEqual((_port(at, "Ratio")["thr"], _port(at, "Ratio")["thr_up"]), (100, 100))
 
 
 if __name__ == "__main__":

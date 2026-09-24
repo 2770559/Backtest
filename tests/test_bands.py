@@ -7,6 +7,10 @@ Semantics under test (backtest_core):
   trigger  <=>  d > U  or  d < -D            U = threshold_up, D = threshold
   threshold_up=None  ==>  U = D  ==>  bit-identical to the pre-2.5.0 |d| > D test
   (tests/legacy_engine_v240.py is a verbatim copy of that engine).
+  band_mode="ratio" (v2.5.2): d is replaced by g − 1, g = (w/t) / ((1−w)/(1−t)),
+  the slot's cumulative return relative to the rest since its last reset — the
+  same U / D mean the same thing for every slot size. band_mode="rel" (default)
+  is the untouched original path.
 """
 import os
 import sys
@@ -21,7 +25,8 @@ sys.path.insert(0, HERE)
 
 from backtest_core import (  # noqa: E402
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_FULL, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_ASYM,
-    apply_local_rebalance, run_detailed_backtest, parse_portfolio,
+    BAND_MODE_REL, BAND_MODE_RATIO, BAND_MODES,
+    apply_local_rebalance, run_detailed_backtest, parse_portfolio, ratio_deviation,
     slot_labels, normalize_slot_bands, build_band_thresholds,
 )
 import legacy_engine_v240 as legacy  # noqa: E402
@@ -437,6 +442,303 @@ class TestTurnoverAndDrift(unittest.TestCase):
         out = run_detailed_backtest(STRAT_BH, pd.DataFrame(columns=["A", "B"]), w, 10000, 0.4, return_stats=True)
         self.assertEqual(len(out), 4)
         self.assertEqual(out[3]["turnover_yr"], 0.0)
+
+
+# --------------------------------------------------------------------------- #
+# v2.5.2 band_mode="ratio" (size-neutral: leg return vs the rest of the portfolio)
+# --------------------------------------------------------------------------- #
+def _w_after(t, r):
+    """Weight of a slot with target t after it beat the rest of the portfolio by r."""
+    return t * (1 + r) / (1 + t * r)
+
+
+class TestRatioDeviation(unittest.TestCase):
+    def test_hand_computed(self):
+        tgt = pd.Series([0.35, 0.65], index=["A", "B"])
+        out = ratio_deviation(pd.Series([0.5, 0.5], index=["A", "B"]), tgt)
+        # A: (0.5/0.35) / (0.5/0.65) = 0.65/0.35 = 1.857...; B is its reciprocal.
+        self.assertAlmostEqual(out["A"], 0.65 / 0.35 - 1, places=12)
+        self.assertAlmostEqual(out["B"], 0.35 / 0.65 - 1, places=12)
+        at_target = ratio_deviation(tgt, tgt)
+        self.assertAlmostEqual(at_target["A"], 0.0, places=12)
+        self.assertAlmostEqual(at_target["B"], 0.0, places=12)
+
+    def test_size_neutral_identity_g_minus_1_equals_r(self):
+        # Whatever the target, a slot that beat the rest by r reads exactly r,
+        # while the relative deviation d = (w − t)/t depends on t.
+        for t in (0.05, 0.10, 0.15, 0.35, 0.65, 0.90):
+            for r in (-0.8, -0.5, -0.2, 0.3, 0.5, 1.0, 3.0):
+                w = _w_after(t, r)
+                got = ratio_deviation(pd.Series([w, 1 - w]), pd.Series([t, 1 - t]))
+                self.assertAlmostEqual(got.iloc[0], r, places=10, msg=(t, r))
+                self.assertAlmostEqual(got.iloc[1], 1 / (1 + r) - 1, places=10, msg=(t, r))
+                d = (w - t) / t
+                if abs(r) > 0.05 and t > 0.1:
+                    self.assertNotAlmostEqual(d, r, places=2, msg=(t, r))
+
+    def test_rel_band_is_size_biased_ratio_band_is_not(self):
+        # The research table: U = 60% under "rel" needs +136% vs the rest for a 35%
+        # slot but only +71% for a 10% slot; under "ratio" both need exactly +60%.
+        def r_needed_rel(t, d):
+            return d / ((1 - t) - t * d)
+        self.assertAlmostEqual(r_needed_rel(0.35, 0.6), 1.3636, places=3)
+        self.assertAlmostEqual(r_needed_rel(0.10, 0.6), 0.7143, places=3)
+        for t in (0.35, 0.10):
+            w = _w_after(t, 0.6)
+            self.assertAlmostEqual(ratio_deviation(pd.Series([w, 1 - w]), pd.Series([t, 1 - t])).iloc[0],
+                                   0.6, places=10)
+
+    def test_degenerate_cases(self):
+        # target 1: no rest -> 0 (never triggers); w = 1 with t < 1 -> +inf; w = 0 -> −1.
+        self.assertEqual(ratio_deviation(pd.Series([1.0]), pd.Series([1.0])).iloc[0], 0.0)
+        out = ratio_deviation(pd.Series([1.0, 0.0], index=["A", "B"]), pd.Series([0.35, 0.65], index=["A", "B"]))
+        self.assertTrue(np.isposinf(out["A"]))
+        self.assertEqual(out["B"], -1.0)
+        self.assertFalse(out.isna().any())
+
+
+class TestRatioModeTriggerSingleton(unittest.TestCase):
+    """A doubles against a flat rest (r = +1): ratio reads exactly 1.0 for a 35%
+    slot AND a 10% slot; the relative deviation reads 0.481 and 0.818."""
+
+    def _cnt(self, t, D, U, mode, strat=STRAT_RD_FULL, a=(100, 200, 200)):
+        w = pd.Series([t, 1 - t], index=["A", "B"])
+        price = _df({"A": list(a), "B": [100] * len(a)})
+        return run_detailed_backtest(strat, price, w, 10000, D, threshold_up=U, band_mode=mode)[1]
+
+    def test_up_trigger_sits_exactly_at_r(self):
+        for t in (0.35, 0.10):
+            self.assertEqual(self._cnt(t, 0.99, 0.99, BAND_MODE_RATIO), 1, t)   # 1.0 > 0.99
+            self.assertEqual(self._cnt(t, 0.99, 1.01, BAND_MODE_RATIO), 0, t)   # 1.0 < 1.01
+
+    def test_rel_mode_same_inputs_is_size_biased(self):
+        # U = 60%: the 10% slot triggers (d = 0.818), the 35% slot does not (d = 0.481).
+        self.assertEqual(self._cnt(0.10, 0.99, 0.6, BAND_MODE_REL), 1)
+        self.assertEqual(self._cnt(0.35, 0.99, 0.6, BAND_MODE_REL), 0)
+        # ... while under "ratio" both read 1.0 and both trigger.
+        self.assertEqual(self._cnt(0.10, 0.99, 0.6, BAND_MODE_RATIO), 1)
+        self.assertEqual(self._cnt(0.35, 0.99, 0.6, BAND_MODE_RATIO), 1)
+
+    def test_down_trigger_sits_exactly_at_r(self):
+        # A halves against the rest (r = −0.5): ratio −0.5; rel d = −0.394 for t = 0.35.
+        for t in (0.35, 0.10):
+            self.assertEqual(self._cnt(t, 0.49, 5.0, BAND_MODE_RATIO, a=(100, 50, 50)), 1, t)
+            self.assertEqual(self._cnt(t, 0.51, 5.0, BAND_MODE_RATIO, a=(100, 50, 50)), 0, t)
+        self.assertEqual(self._cnt(0.35, 0.49, 5.0, BAND_MODE_REL, a=(100, 50, 50)), 0)
+
+    def test_down_band_at_or_above_100_never_triggers_downward(self):
+        # g >= 0, so g − 1 >= −1: D = 100% can only be reached, never crossed —
+        # the same property as the relative deviation. (A −99% collapse is the
+        # OTHER slot's +9900% vs the rest, so U is parked far away to isolate D.)
+        self.assertEqual(self._cnt(0.35, 1.0, 1e6, BAND_MODE_RATIO, a=(100, 1, 1)), 0)
+        self.assertEqual(self._cnt(0.35, 1.0, 1e6, BAND_MODE_REL, a=(100, 1, 1)), 0)
+        # ... and with U back in range that collapse IS the rest's up-breach.
+        self.assertEqual(self._cnt(0.35, 1.0, 5.0, BAND_MODE_RATIO, a=(100, 1, 1)), 1)
+
+    def test_global_reset_restores_targets(self):
+        w = pd.Series([0.35, 0.65], index=["A", "B"])
+        price = _df({"A": [100, 200, 200], "B": [100, 100, 100]})
+        hist, cnt, _ = run_detailed_backtest(STRAT_RD_FULL, price, w, 10000, 0.99, threshold_up=0.99,
+                                             band_mode=BAND_MODE_RATIO)
+        self.assertEqual(cnt, 1)
+        post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
+        self.assertEqual((post["A"], post["B"]), ("35.00%", "65.00%"))
+
+    def test_single_slot_portfolio_never_triggers(self):
+        w = pd.Series([1.0], index=["A"])
+        price = _df({"A": [100, 300, 20, 50]})
+        for mode in BAND_MODES:
+            hist, cnt, _ = run_detailed_backtest(STRAT_RD_FULL, price, w, 10000, 0.2, band_mode=mode)
+            self.assertEqual(cnt, 0, mode)
+            self.assertFalse(hist.empty)
+
+    def test_invalid_mode_raises(self):
+        w = pd.Series([0.35, 0.65], index=["A", "B"])
+        price = _df({"A": [100, 200], "B": [100, 100]})
+        with self.assertRaises(ValueError):
+            run_detailed_backtest(STRAT_RD_FULL, price, w, 10000, 0.4, band_mode="abs")
+        with self.assertRaises(ValueError):
+            apply_local_rebalance(pd.Series([1.0, 1.0]), pd.Series([0.5, 0.5]), 0.4, band_mode="")
+
+
+class TestRatioModeComposite(unittest.TestCase):
+    """(A, B) is one 35% slot next to C 65%. Decisions use the slot AGGREGATE."""
+
+    def setUp(self):
+        self.w = pd.Series([0.175, 0.175, 0.65], index=["A", "B", "C"])
+        self.groups = {"A": "AB", "B": "AB"}
+
+    def _run(self, a, b, U, strat=STRAT_RD_FULL):
+        price = _df({"A": a, "B": b, "C": [100] * len(a)})
+        return run_detailed_backtest(strat, price, self.w, 10000, 0.99, groups=self.groups,
+                                     threshold_up=U, band_mode=BAND_MODE_RATIO)
+
+    def test_slot_aggregate_doubling_triggers(self):
+        self.assertEqual(self._run([100, 200, 200], [100, 200, 200], 0.99)[1], 1)
+        self.assertEqual(self._run([100, 200, 200], [100, 200, 200], 1.01)[1], 0)
+
+    def test_internal_drift_never_triggers(self):
+        # A doubles, B halves: the slot is 0.4375 vs 0.35 -> r = +0.25 only.
+        self.assertEqual(self._run([100, 200, 200], [100, 50, 50], 0.26)[1], 0)
+        self.assertEqual(self._run([100, 200, 200], [100, 50, 50], 0.24)[1], 1)
+
+    def test_reset_restores_equal_split(self):
+        hist, cnt, _ = self._run([100, 400, 400], [100, 100, 100], 0.99)
+        self.assertEqual(cnt, 1)
+        post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
+        self.assertEqual((post["A"], post["B"], post["C"]), ("17.50%", "17.50%", "65.00%"))
+
+
+class TestRatioModeMixedAndLocal(unittest.TestCase):
+    """A 5% / B 60% / C 35%. A quadruples, B +10%, C flat -> values 0.2 / 0.66 / 0.35.
+    Ratio readings: A +2.76 (rel: +2.31), B −0.20 (rel: −0.09), C −0.24 (rel: −0.17)."""
+
+    def setUp(self):
+        self.w = pd.Series([0.05, 0.60, 0.35], index=["A", "B", "C"])
+        self.price = _df({"A": [100, 400, 400], "B": [100, 110, 110], "C": [100, 100, 100]})
+        self.vals = pd.Series([200.0, 660.0, 350.0], index=["A", "B", "C"])
+
+    def test_readings(self):
+        got = ratio_deviation(self.vals / self.vals.sum(), self.w)
+        self.assertAlmostEqual(got["A"], 4 / (1.01 / 0.95) - 1, places=12)      # A ×4 vs rest ×1.0632
+        self.assertAlmostEqual(got["B"], 1.1 / (0.55 / 0.40) - 1, places=12)    # B ×1.1 vs rest ×1.375
+        self.assertAlmostEqual(got["C"], 1.0 / (0.86 / 0.65) - 1, places=12)    # C ×1.0 vs rest ×1.323
+
+    def test_minor_breach_is_local_reset_under_mixed(self):
+        hist, cnt, _ = run_detailed_backtest(STRAT_RD_MIXED, self.price, self.w, 10000, 0.5,
+                                             threshold_up=2.5, band_mode=BAND_MODE_RATIO)
+        self.assertEqual(cnt, 1)
+        post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
+        # A back to 5%; B and C share the remainder in their pre-reset proportion
+        # (660 : 350), NOT reset to 60 / 35.
+        total = 1210.0
+        b_exp = (total - 0.05 * total) * 660 / 1010 / total
+        self.assertEqual(post["A"], "5.00%")
+        self.assertAlmostEqual(_pct(post["B"]), b_exp, places=4)
+        self.assertAlmostEqual(_pct(post["C"]), 0.95 - b_exp, places=4)
+        # The same U = 2.5 does NOT trigger under "rel" (A reads +2.31 there).
+        self.assertEqual(run_detailed_backtest(STRAT_RD_MIXED, self.price, self.w, 10000, 0.5,
+                                               threshold_up=2.5, band_mode=BAND_MODE_REL)[1], 0)
+
+    def test_major_breach_is_global_reset_under_mixed(self):
+        w = pd.Series([0.35, 0.60, 0.05], index=["A", "B", "C"])
+        price = _df({"A": [100, 300, 300], "B": [100, 100, 100], "C": [100, 100, 100]})
+        hist, cnt, _ = run_detailed_backtest(STRAT_RD_MIXED, price, w, 10000, 0.5, threshold_up=1.5,
+                                             band_mode=BAND_MODE_RATIO)
+        self.assertEqual(cnt, 1)
+        post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
+        self.assertEqual((post["A"], post["B"], post["C"]), ("35.00%", "60.00%", "5.00%"))
+
+    def test_apply_local_rebalance_ratio_direct(self):
+        out, resets = apply_local_rebalance(self.vals, self.w, 0.5, return_resets=True, threshold_up=2.5,
+                                            band_mode=BAND_MODE_RATIO)
+        self.assertEqual(resets, {"A"})
+        self.assertAlmostEqual(out["A"], 0.05 * 1210.0, places=9)
+        self.assertAlmostEqual(out["B"], (1210.0 - 60.5) * 660 / 1010, places=9)
+        self.assertAlmostEqual(out["C"], (1210.0 - 60.5) * 350 / 1010, places=9)
+        self.assertAlmostEqual(out.sum(), 1210.0, places=9)
+        # Under "rel" the same bands leave everything untouched.
+        out_rel, resets_rel = apply_local_rebalance(self.vals, self.w, 0.5, return_resets=True,
+                                                    threshold_up=2.5, band_mode=BAND_MODE_REL)
+        self.assertEqual(resets_rel, set())
+        pd.testing.assert_series_equal(out_rel, self.vals, check_exact=True)
+
+    def test_local_cascade_retests_remainder_in_ratio_terms(self):
+        # A 35% / B 20% / C 45%; A ×2.05, B ×0.2, C ×1.5 -> values 71.75 / 4 / 67.5.
+        # Pass 1 readings: A +0.864 (breach at U = 0.8), B −0.885 (inside D = 0.95),
+        # C +0.089. Resetting A hands its excess to B and C (×1.302): C now reads
+        # +0.941 and breaches on the SECOND pass; B (−0.849) still does not. Under
+        # "rel" nothing breaches at all (A reads +0.431, C +0.047).
+        w = pd.Series([0.35, 0.20, 0.45], index=["A", "B", "C"])
+        vals = pd.Series([71.75, 4.0, 67.5], index=["A", "B", "C"])
+        first = ratio_deviation(vals / vals.sum(), w)
+        self.assertGreater(first["A"], 0.8)
+        self.assertLess(first["C"], 0.8)                       # C is inside the band before the reset
+        self.assertGreater(first["B"], -0.95)
+        out, resets = apply_local_rebalance(vals, w, 0.95, return_resets=True, threshold_up=0.8,
+                                            band_mode=BAND_MODE_RATIO)
+        self.assertEqual(resets, {"A", "C"})
+        total = 143.25
+        self.assertAlmostEqual(out["A"], 0.35 * total, places=9)
+        self.assertAlmostEqual(out["C"], 0.45 * total, places=9)
+        self.assertAlmostEqual(out["B"], 0.20 * total, places=9)   # last one standing takes the rest
+        out_rel, resets_rel = apply_local_rebalance(vals, w, 0.95, return_resets=True, threshold_up=0.8,
+                                                    band_mode=BAND_MODE_REL)
+        self.assertEqual(resets_rel, set())
+        pd.testing.assert_series_equal(out_rel, vals, check_exact=True)
+        # Same geometry through the engine (Local strategy): one rebalance, all at target.
+        price = _df({"A": [100, 205, 205], "B": [100, 20, 20], "C": [100, 150, 150]})
+        hist, cnt, _ = run_detailed_backtest(STRAT_RD_LOCAL, price, w, 10000, 0.95, threshold_up=0.8,
+                                             band_mode=BAND_MODE_RATIO)
+        self.assertEqual(cnt, 1)
+        post = hist[hist["Type"] == "Post-Rebal"].iloc[0]
+        self.assertEqual((post["A"], post["B"], post["C"]), ("35.00%", "20.00%", "45.00%"))
+        self.assertEqual(run_detailed_backtest(STRAT_RD_LOCAL, price, w, 10000, 0.95, threshold_up=0.8,
+                                               band_mode=BAND_MODE_REL)[1], 0)
+
+    def test_per_slot_dict_bands_in_ratio_mode(self):
+        # Tight U only on A (a "crypto sleeve" style override), wide elsewhere.
+        hist, cnt, _ = run_detailed_backtest(STRAT_RD_MIXED, self.price, self.w, 10000, {"*": 0.9},
+                                             threshold_up={"*": 5.0, "A": 2.5}, band_mode=BAND_MODE_RATIO)
+        self.assertEqual(cnt, 1)
+        self.assertEqual(run_detailed_backtest(STRAT_RD_MIXED, self.price, self.w, 10000, {"*": 0.9},
+                                               threshold_up={"*": 5.0, "A": 3.0},
+                                               band_mode=BAND_MODE_RATIO)[1], 0)
+
+
+class TestRatioModeBitIdentityAndScope(unittest.TestCase):
+    def _assert_same(self, a, b):
+        pd.testing.assert_frame_equal(a[0], b[0], check_exact=True)
+        self.assertEqual(a[1], b[1])
+        self.assertEqual(a[2], b[2])
+
+    def test_explicit_rel_mode_is_the_legacy_engine(self):
+        for seed in range(8):
+            price, w, groups = _random_case(seed)
+            for strat in (STRAT_RD_FULL, STRAT_RD_MIXED, STRAT_RD_LOCAL, STRAT_ASYM):
+                for thr in (0.2, 0.4):
+                    ref = legacy.run_detailed_backtest(strat, price, w, 10000, thr, groups=groups)
+                    self._assert_same(ref, run_detailed_backtest(strat, price, w, 10000, thr, groups=groups,
+                                                                 band_mode=BAND_MODE_REL))
+
+    def test_apply_local_rebalance_explicit_rel_bit_identical(self):
+        rng = np.random.default_rng(11)
+        for _ in range(200):
+            n = int(rng.integers(2, 7))
+            idx = [chr(65 + k) for k in range(n)]
+            vals = pd.Series(rng.uniform(50, 5000, size=n), index=idx)
+            tgt = rng.dirichlet(np.ones(n))
+            tgt = pd.Series(tgt / tgt.sum(), index=idx)
+            thr = float(rng.choice([0.1, 0.2, 0.3, 0.5]))
+            ref_v, ref_r = legacy.apply_local_rebalance(vals, tgt, thr, return_resets=True)
+            v, r = apply_local_rebalance(vals, tgt, thr, return_resets=True, band_mode=BAND_MODE_REL)
+            pd.testing.assert_series_equal(ref_v, v, check_exact=True)
+            self.assertEqual(ref_r, r)
+
+    def test_ratio_mode_changes_some_decisions(self):
+        diffs = 0
+        for seed in range(12):
+            price, w, groups = _random_case(seed)
+            a = run_detailed_backtest(STRAT_RD_MIXED, price, w, 10000, 0.3, groups=groups)[1]
+            b = run_detailed_backtest(STRAT_RD_MIXED, price, w, 10000, 0.3, groups=groups,
+                                      band_mode=BAND_MODE_RATIO)[1]
+            diffs += int(a != b)
+        self.assertGreater(diffs, 0)
+
+    def test_non_reldiff_strategies_ignore_band_mode(self):
+        for seed in range(6):
+            price, w, groups = _random_case(seed)
+            for strat in (STRAT_ASYM, STRAT_ANNUAL, STRAT_SEMI, STRAT_BH):
+                self._assert_same(
+                    run_detailed_backtest(strat, price, w, 10000, 0.3, groups=groups, band_mode=BAND_MODE_REL),
+                    run_detailed_backtest(strat, price, w, 10000, 0.3, groups=groups, band_mode=BAND_MODE_RATIO))
+
+    def test_stats_arity_unchanged_in_ratio_mode(self):
+        price, w, groups = _random_case(3)
+        four = run_detailed_backtest(STRAT_RD_MIXED, price, w, 10000, 0.3, groups=groups, return_stats=True,
+                                     band_mode=BAND_MODE_RATIO)
+        self.assertEqual(len(four), 4)
+        self.assertIn("turnover_yr", four[3])
 
 
 if __name__ == "__main__":
