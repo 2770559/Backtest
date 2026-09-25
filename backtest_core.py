@@ -261,6 +261,179 @@ def build_band_thresholds(thr_pct, thr_up_pct, slot_bands, label_to_id):
     return threshold, threshold_up
 
 
+def band_trigger_weights(target, down, up, band_mode=BAND_MODE_REL):
+    """Weight levels at which a slot crosses its bands (v2.5.3; moved from the
+    app in v2.6.0 so the live desk shares it) — the inverse of the engine's
+    trigger test, e.g. "triggers below 3.06% / above 51.85%" for "−40% / +100%".
+
+    target, down, up are fractions. Returns (w_below, w_above); a side is None
+    when it can never trigger: a weight cannot fall below 0 (down >= 100%) or
+    rise above 100%.
+      Δ vs target : w = t·(1 ∓ band)
+      Leg vs rest : w = t·(1 ∓ band) / (1 ∓ t·band)     (g = 1 ∓ band solved for w)
+    """
+    t = float(target)
+    if not (0.0 < t < 1.0):
+        return None, None
+    d, u = float(down), float(up)
+    if band_mode == BAND_MODE_RATIO:
+        w_dn = t * (1.0 - d) / (1.0 - t * d) if d < 1.0 else None
+        w_up = t * (1.0 + u) / (1.0 + t * u)
+    else:
+        w_dn = t * (1.0 - d) if d < 1.0 else None
+        w_up = t * (1.0 + u)
+    if w_up >= 1.0:
+        w_up = None
+    return w_dn, w_up
+
+
+def align_price_data(price_data, bench_tk, start_d, port_tickers):
+    """The app's alignment of downloaded prices, as a pure function (v2.6.0) so
+    the backtest page and the live desk run on byte-identical frames.
+
+    price_data   : adjusted closes, one column per ticker (calendar as fetched)
+    bench_tk     : benchmark column; its trading days define the calendar
+    start_d      : requested start date
+    port_tickers : every portfolio element (decides a late-listing start)
+
+    Returns {"final_data", "price_df", "market_start_day", "actual_start_day",
+    "notice": (level, text) | None, "error": text | None}. price_df is the
+    month-end sampled frame the engine runs on (the daily frame when the
+    window is shorter than 90 days). Messages are the app's, verbatim.
+    """
+    out = {"final_data": None, "price_df": None, "market_start_day": None,
+           "actual_start_day": None, "notice": None, "error": None}
+    bench_valid_days = price_data[bench_tk].dropna().index
+    future_days = bench_valid_days[bench_valid_days >= pd.Timestamp(start_d)]
+    if future_days.empty:
+        last = f" (last print {bench_valid_days[-1].date()})" if len(bench_valid_days) else ""
+        out["error"] = (f"Benchmark **{bench_tk}** has no prices on or after {start_d}{last} "
+                        "\u2014 delisted? Pick another benchmark.")
+        return out
+    market_start_day = future_days[0]
+
+    # ffill on full calendar first so weekend crypto prices carry to next trading day
+    price_data_prefilled = price_data.ffill()
+    df_aligned = price_data_prefilled.reindex(bench_valid_days)
+    df_aligned = df_aligned[df_aligned.index >= market_start_day]
+    df_filled = df_aligned.ffill().bfill()
+
+    raw_aligned = df_aligned[list(port_tickers)]
+    first_valid_idx = raw_aligned.apply(lambda x: x.first_valid_index())
+    # Guard idxmax: empty (no portfolio tickers) or all-None (every ticker
+    # dataless) raises / is deprecated in pandas. Downstream per-portfolio
+    # "no usable data" errors handle the degenerate cases.
+    if first_valid_idx.notna().any():
+        bottleneck_date = first_valid_idx.max()
+        bottleneck_ticker = first_valid_idx.dropna().idxmax()
+    else:
+        bottleneck_date, bottleneck_ticker = pd.NaT, None
+    # A portfolio asset listing after the start moves the start to its listing
+    # day, however late the benchmark itself listed: it would otherwise be
+    # bfilled into flat fabricated prices for the whole pre-listing stretch.
+    late_ticker = pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7
+    actual_start_day = bottleneck_date if late_ticker else market_start_day
+
+    # ONE notice, naming whatever finally decided the start day (v2.4.2).
+    requested = pd.Timestamp(start_d).date()
+    days_diff_bench = (market_start_day.date() - requested).days
+    if late_ticker:
+        out["notice"] = ("warning", f"**{bottleneck_ticker}** listed late \u2014 backtest starts "
+                                    f"{actual_start_day.date()} (requested {requested}).")
+    elif days_diff_bench > 7:
+        out["notice"] = ("warning", f"Benchmark **{bench_tk}** not listed until {market_start_day.date()} "
+                                    f"\u2014 backtest starts there (requested {requested}).")
+    elif days_diff_bench > 0:
+        out["notice"] = ("info", f"Aligned to next trading day: {market_start_day.date()}")
+
+    final_data = df_filled[df_filled.index >= actual_start_day]
+    out.update(market_start_day=market_start_day, actual_start_day=actual_start_day, final_data=final_data)
+    if final_data.empty:
+        out["error"] = "Insufficient data."
+        return out
+    days_span = (final_data.index[-1] - final_data.index[0]).days
+    out["price_df"] = final_data.copy() if days_span < 90 else sample_monthly(final_data)
+    return out
+
+
+def prepare_portfolio(p, p_tks, p_wts, p_comp, price_df):
+    """The app's per-portfolio preparation, as a pure function (v2.6.0): drop
+    dataless elements (a composite is re-split among its survivors, a slot goes
+    only when all its elements are dataless), renormalise when something was
+    dropped, build the engine groups for composites and the per-slot bands.
+
+    Returns {"valid_tks", "w_series", "groups", "slots", "slot_survivors",
+    "label_to_id", "thr_dn", "thr_up", "notices": [(level, text)], "error"}.
+    Messages are the app's, verbatim.
+    """
+    out = {"valid_tks": [], "w_series": None, "groups": None, "slots": [], "slot_survivors": {},
+           "label_to_id": {}, "thr_dn": None, "thr_up": None, "notices": [], "error": None}
+    has_data = lambda t: t in price_df.columns and not price_df[t].isna().all()
+
+    # Slot view: composite metadata if present, else one singleton per element.
+    if p_comp:
+        slots = list(zip(p_comp["slot_labels"], p_comp["slot_members"], p_comp["slot_targets"]))
+    else:
+        slots = [(t, [t], w) for t, w in zip(p_tks, p_wts)]
+
+    # Drop dataless elements: re-split a slot among survivors; drop a slot
+    # only if ALL its elements are dataless.
+    valid_p_tks, elem_weights, slot_survivors = [], {}, {}
+    dropped_elems, dropped_slots = [], []
+    for si, (lbl, members, st_w) in enumerate(slots):
+        live = [t for t in members if has_data(t)]
+        dead = [t for t in members if not has_data(t)]
+        if not live:
+            dropped_slots.append(lbl); continue
+        if dead: dropped_elems.extend(dead)
+        per = st_w / len(live)                 # equal split across survivors
+        for t in live:
+            elem_weights[t] = per; valid_p_tks.append(t)
+        slot_survivors[si] = live
+    out.update(slots=slots, slot_survivors=slot_survivors, valid_tks=valid_p_tks)
+    if not valid_p_tks:
+        out["error"] = f"**{p['name']}**: no usable data for any ticker ({', '.join(p_tks)}) \u2014 portfolio skipped."
+        return out
+
+    w_series = pd.Series(elem_weights).reindex(valid_p_tks)
+    # Renormalize ONLY when something was dropped (no-drop path stays
+    # byte-identical to the legacy un-normalized weights). One-shot
+    # normalization handles intra-slot re-split + cross-slot drop together.
+    if dropped_elems or dropped_slots:
+        if w_series.sum() <= 0:
+            # e.g. every nonzero-weight slot was dataless: 0/0 -> NaN
+            # weights would silently produce an empty backtest.
+            out["error"] = (f"**{p['name']}**: surviving tickers carry no positive weight "
+                            f"after dropping dataless ones \u2014 portfolio skipped.")
+            return out
+        w_series = w_series / w_series.sum()
+    if dropped_elems:
+        out["notices"].append(("warning",
+            f"**{p['name']}**: no data for **{', '.join(dropped_elems)}** \u2014 "
+            "dropped from their composite; slot re-split among remaining elements."))
+    if dropped_slots:
+        out["notices"].append(("warning",
+            f"**{p['name']}**: no data for **{', '.join(dropped_slots)}** \u2014 "
+            "dropped; remaining weights renormalized: "
+            + ", ".join(f"{t} {w:.1%}" for t, w in w_series.items())))
+
+    # Engine groups: element -> synthetic slot-id, only for composite slots
+    # that still have >1 surviving element. Empty => None => legacy path.
+    groups = {}
+    for si, live in slot_survivors.items():
+        if len(live) > 1:
+            for t in live: groups[t] = f"__slot{si}"
+    # Bands (v2.5.0): slot label -> engine slot id (the ticker for a singleton,
+    # the synthetic id for a composite) so per-slot overrides reach the engine;
+    # symmetric configs collapse to the legacy scalar path.
+    label_to_id = {}
+    for si, live in slot_survivors.items():
+        label_to_id[slots[si][0]] = f"__slot{si}" if len(live) > 1 else live[0]
+    thr_dn, thr_up = build_band_thresholds(p['thr'], p.get('thr_up'), p.get('slot_bands'), label_to_id)
+    out.update(w_series=w_series, groups=groups or None, label_to_id=label_to_id, thr_dn=thr_dn, thr_up=thr_up)
+    return out
+
+
 def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
     empty = {"final_nav": "-", "total_ret": "-", "ann_ret": "-", "max_dd": "-", "sharpe": "-", "rebal_cnt": "-",
              "_total_ret": 0, "_ann_ret": 0, "_max_dd": 0, "_sharpe": 0}
@@ -390,7 +563,8 @@ def _empty_stats():
     return {"sold_total": 0.0, "nav_mean": 0.0, "years": 0.0, "turnover_yr": 0.0,
             "slot_ids": [], "slot_members": {}, "slot_target": {},
             "weight_min": {}, "weight_max": {},
-            "rebal_events": [], "rebal_global": 0, "rebal_local": 0}
+            "rebal_events": [], "rebal_global": 0, "rebal_local": 0,
+            "last_values": {}, "last_date": None}
 
 
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
@@ -447,7 +621,10 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         Local). trigger = the slots that breached their band on that bar
         (empty for the time-based Periodic strategies).
       rebal_global / rebal_local : counts of the two scopes.
-    The history DataFrame and every decision are unchanged by this record.
+      last_values / last_date (v2.6.0) : exact element values ($) carried out
+        of the final processed bar (after any rebalance on it) and its date,
+        for share-level arithmetic; the history rows only hold rounded weights.
+    The history DataFrame and every decision are unchanged by these records.
     """
     _check_band_mode(band_mode)
     tickers = price_df.columns
@@ -503,6 +680,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     sold_total = 0.0
     nav_sum, nav_n = 0.0, 0
     events = []                                                    # rebalance scope log (v2.5.4)
+    last_vals = None                                               # values carried out of the last bar (v2.6.0)
     first_date = last_date = None
     w_ext = {"min": None, "max": None}
 
@@ -533,6 +711,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
             rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(rec)
             _track(asset_values.groupby(slot_of).sum().reindex(slot_ids) / total_val)
+            last_vals = asset_values
             continue
 
         # ---- FOLD: aggregate elements up to slots for the decision ----
@@ -634,11 +813,13 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
             post_rec = {"Date": current_date, "Type": "Post-Rebal", "NAV": total_val}
             post_rec.update({f"{t}": f"{post_weights[t]:.2%}" for t in tickers})
             history.append(post_rec)
+            last_vals = new_values
         else:
             rec = {"Date": current_date, "Type": "Hold", "NAV": total_val}
             rec.update({f"{t}": f"{current_weights[t]:.2%}" for t in tickers})
             history.append(rec)
             _track(slot_weights)
+            last_vals = asset_values
 
     total_pnl = cumulative_pnl.sum()
     pct_pnl = cumulative_pnl / total_pnl if total_pnl != 0 else cumulative_pnl * 0
@@ -663,6 +844,8 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
         "rebal_events": events,
         "rebal_global": sum(1 for e in events if e["scope"] == "global"),
         "rebal_local": sum(1 for e in events if e["scope"] == "local"),
+        "last_values": {t: float(v) for t, v in last_vals.items()} if last_vals is not None else {},
+        "last_date": last_date,
     }
     return pd.DataFrame(history), rebalance_count, pnl_rec, stats
 

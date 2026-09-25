@@ -24,6 +24,19 @@ try:
 except ImportError:            # optional dependency: browser-persisted default disabled
     HAS_JS_EVAL = False
 
+def _fresh_core():
+    """Streamlit Cloud hot-reloads this script on a push but can keep the old
+    backtest_core in sys.modules until the app is rebooted: the import below
+    then fails on names added in this version (seen after the v2.5.0 push).
+    Reload the module when those names are missing (v2.6.0)."""
+    import importlib
+    import backtest_core
+    if not all(hasattr(backtest_core, n) for n in ("align_price_data", "prepare_portfolio", "band_trigger_weights")):
+        importlib.reload(backtest_core)
+
+
+_fresh_core()
+
 from backtest_core import (
     STRAT_BH, STRAT_ANNUAL, STRAT_SEMI,
     STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL, STRAT_ASYM,
@@ -33,13 +46,14 @@ from backtest_core import (
     scrub_leading_glitches, scrub_isolated_spikes, sample_monthly,
     _split_top_level, slot_labels, normalize_slot_bands, build_band_thresholds,
     BAND_MODE_REL, BAND_MODE_RATIO, BAND_MODES,
+    band_trigger_weights, align_price_data, prepare_portfolio,
 )
 
 # Band mode (v2.5.2) as shown in the portfolio row: what Down % / Up % measure.
 BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
 
 # --- Version ---
-APP_VERSION = "2.5.4"  # semver: major.minor.patch
+APP_VERSION = "2.6.0"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-09-24"
 
 # --- 1. Page Config ---
@@ -310,12 +324,21 @@ section[data-testid="stSidebar"] h3 {
 </style>
 """, unsafe_allow_html=True)
 
+# --- Mode (v2.6.0): Backtest | Live Portfolio ---
+# Always rendered first in the sidebar in both modes, so it never shifts the
+# blocks below it (see the v2.5.1 note on transient elements).
+APP_MODE = st.sidebar.radio("Mode", ["Backtest", "Live Portfolio"], horizontal=True, key="app_mode",
+                            label_visibility="collapsed")
+_HDR = ({"Backtest": ("Portfolio Backtest & Rebalance Analyzer", "Multi-portfolio backtesting with rebalancing strategies"),
+         "Live Portfolio": ("Live Portfolio Desk", "Share-level orders that keep the real account on the live rule's backtest")}
+        [APP_MODE])
+
 # --- Header ---
 st.markdown(f"""
 <div class="header-bar">
     <div>
-        <h2>Portfolio Backtest & Rebalance Analyzer</h2>
-        <div class="subtitle">Multi-portfolio backtesting with rebalancing strategies</div>
+        <h2>{_HDR[0]}</h2>
+        <div class="subtitle">{_HDR[1]}</div>
     </div>
     <div class="version-badge">v{APP_VERSION} · {APP_BUILD_DATE}</div>
 </div>
@@ -364,34 +387,6 @@ def _norm_band_mode(v):
     anything else or missing -> "rel", the original rule, so pre-2.5.2 configs
     run unchanged."""
     return BAND_MODE_RATIO if str(v or "").strip().lower() == BAND_MODE_RATIO else BAND_MODE_REL
-
-
-def band_trigger_weights(target, down, up, band_mode=BAND_MODE_REL):
-    """Weight levels at which a slot crosses its bands (v2.5.3) — the display
-    side inverse of the engine's trigger test, so the results page can say
-    "triggers below 3.06% / above 51.85%" next to a band of "−40% / +100%".
-
-    target, down, up are fractions. Returns (w_below, w_above); a side is None
-    when it can never trigger: a weight cannot fall below 0 (down >= 100%) or
-    rise above 100%.
-      Δ vs target : w = t·(1 ∓ band)
-      Leg vs rest : w = t·(1 ∓ band) / (1 ∓ t·band)     (g = 1 ∓ band solved for w)
-    Kept in the app (not backtest_core) on purpose: it is presentation only,
-    and a core change would need a Cloud reboot for the cached module.
-    """
-    t = float(target)
-    if not (0.0 < t < 1.0):
-        return None, None
-    d, u = float(down), float(up)
-    if band_mode == BAND_MODE_RATIO:
-        w_dn = t * (1.0 - d) / (1.0 - t * d) if d < 1.0 else None
-        w_up = t * (1.0 + u) / (1.0 + t * u)
-    else:
-        w_dn = t * (1.0 - d) if d < 1.0 else None
-        w_up = t * (1.0 + u)
-    if w_up >= 1.0:
-        w_up = None
-    return w_dn, w_up
 
 
 # Rebalance-row colours in the detail table (v2.5.4): (Pre-Rebal, Post-Rebal).
@@ -1333,6 +1328,14 @@ def _confirm_save_default():
             st.session_state['_flash_toast'] = "Default reset — new sessions open with built-ins"
             st.rerun()
 
+# Live Portfolio mode: the desk replaces the whole Backtest UI. It reuses this
+# page's price cache (fetch_price_history) and saved configs; the Backtest
+# settings keep their values in session state while the other mode is shown.
+if APP_MODE == "Live Portfolio":
+    import live_page
+    live_page.render_live_desk(fetch_price_history, SAVED_CONFIG_DIR)
+    st.stop()
+
 with st.sidebar:
     st.markdown("### Settings")
 
@@ -1707,62 +1710,18 @@ if st.session_state.run_backtest:
         if spiked:
             st.warning("Dropped isolated mid-series price glitch(es): " + "; ".join(spiked))
 
-        bench_valid_days = price_data[bench_tk].dropna().index
-        future_days = bench_valid_days[bench_valid_days >= pd.Timestamp(start_d)]
-        if future_days.empty:
-            last = f" (last print {bench_valid_days[-1].date()})" if len(bench_valid_days) else ""
-            st.error(f"Benchmark **{bench_tk}** has no prices on or after {start_d}{last} "
-                     "\u2014 delisted? Pick another benchmark.")
-            st.stop()
-        market_start_day = future_days[0]
-
-        # ffill on full calendar first so weekend crypto prices carry to next trading day
-        price_data_prefilled = price_data.ffill()
-        df_aligned = price_data_prefilled.reindex(bench_valid_days)
-        df_aligned = df_aligned[df_aligned.index >= market_start_day]
-        df_filled = df_aligned.ffill().bfill()
-
+        # Calendar alignment, late-listing start and month-end sampling live in
+        # backtest_core.align_price_data (v2.6.0) so the live desk runs on the
+        # identical frame; messages and their order are unchanged.
         all_port_tks = sorted({t for _, p_tks, _, _ in parsed_ports for t in p_tks})
-        raw_aligned = df_aligned[all_port_tks]
-        first_valid_idx = raw_aligned.apply(lambda x: x.first_valid_index())
-        # Guard idxmax: empty (no portfolio tickers) or all-None (every ticker
-        # dataless) raises / is deprecated in pandas. Downstream per-portfolio
-        # "no usable data" errors handle the degenerate cases.
-        if first_valid_idx.notna().any():
-            bottleneck_date = first_valid_idx.max()
-            bottleneck_ticker = first_valid_idx.dropna().idxmax()
-        else:
-            bottleneck_date, bottleneck_ticker = pd.NaT, None
-        # A portfolio asset listing after the start moves the start to its listing
-        # day, however late the benchmark itself listed: it would otherwise be
-        # bfilled into flat fabricated prices for the whole pre-listing stretch.
-        late_ticker = pd.notna(bottleneck_date) and (bottleneck_date - market_start_day).days > 7
-        actual_start_day = bottleneck_date if late_ticker else market_start_day
-
-        # ONE notice, naming whatever finally decided the start day. The steps
-        # it overrides (weekend/holiday alignment, benchmark listing) describe a
-        # date the backtest never starts on, so reporting them too was noise at
-        # best and misleading at worst ("Aligned to 2020-01-02" above a run
-        # that KMLM pushed to 2020-12-02).
-        requested = pd.Timestamp(start_d).date()
-        days_diff_bench = (market_start_day.date() - requested).days
-        if late_ticker:
-            st.warning(f"**{bottleneck_ticker}** listed late \u2014 backtest starts "
-                       f"{actual_start_day.date()} (requested {requested}).")
-        elif days_diff_bench > 7:
-            st.warning(f"Benchmark **{bench_tk}** not listed until {market_start_day.date()} "
-                       f"\u2014 backtest starts there (requested {requested}).")
-        elif days_diff_bench > 0:
-            st.info(f"Aligned to next trading day: {market_start_day.date()}")
-
-        final_data = df_filled[df_filled.index >= actual_start_day]
-        if final_data.empty: st.error("Insufficient data."); st.stop()
+        aligned = align_price_data(price_data, bench_tk, start_d, all_port_tks)
+        if aligned["notice"]:
+            (st.warning if aligned["notice"][0] == "warning" else st.info)(aligned["notice"][1])
+        if aligned["error"]:
+            st.error(aligned["error"]); st.stop()
+        actual_start_day = aligned["actual_start_day"]
+        final_data, price_df = aligned["final_data"], aligned["price_df"]
         days_span = (final_data.index[-1] - final_data.index[0]).days
-
-        if days_span < 90:
-            price_df = final_data.copy()
-        else:
-            price_df = sample_monthly(final_data)
 
         comp_df = pd.DataFrame(index=price_df.index)
         bench_nav = (price_df[bench_tk] / price_df[bench_tk].iloc[0]) * init_f
@@ -1783,70 +1742,17 @@ if st.session_state.run_backtest:
             except (ValueError, TypeError): return np.nan
 
         for p, p_tks, p_wts, p_comp in parsed_ports:
-            has_data = lambda t: t in price_df.columns and not price_df[t].isna().all()
-
-            # Slot view: composite metadata if present, else one singleton per element.
-            if p_comp:
-                slots = list(zip(p_comp["slot_labels"], p_comp["slot_members"], p_comp["slot_targets"]))
-            else:
-                slots = [(t, [t], w) for t, w in zip(p_tks, p_wts)]
-
-            # Drop dataless elements: re-split a slot among survivors; drop a slot
-            # only if ALL its elements are dataless.
-            valid_p_tks, elem_weights, slot_survivors = [], {}, {}
-            dropped_elems, dropped_slots = [], []
-            for si, (lbl, members, st_w) in enumerate(slots):
-                live = [t for t in members if has_data(t)]
-                dead = [t for t in members if not has_data(t)]
-                if not live:
-                    dropped_slots.append(lbl); continue
-                if dead: dropped_elems.extend(dead)
-                per = st_w / len(live)                 # equal split across survivors
-                for t in live:
-                    elem_weights[t] = per; valid_p_tks.append(t)
-                slot_survivors[si] = live
-            if not valid_p_tks:
-                st.error(f"**{p['name']}**: no usable data for any ticker ({', '.join(p_tks)}) \u2014 portfolio skipped.")
-                continue
-
-            w_series = pd.Series(elem_weights).reindex(valid_p_tks)
-            # Renormalize ONLY when something was dropped (no-drop path stays
-            # byte-identical to the legacy un-normalized weights). One-shot
-            # normalization handles intra-slot re-split + cross-slot drop together.
-            if dropped_elems or dropped_slots:
-                if w_series.sum() <= 0:
-                    # e.g. every nonzero-weight slot was dataless: 0/0 -> NaN
-                    # weights would silently produce an empty backtest.
-                    st.error(f"**{p['name']}**: surviving tickers carry no positive weight "
-                             f"after dropping dataless ones — portfolio skipped.")
-                    continue
-                w_series = w_series / w_series.sum()
-            if dropped_elems:
-                st.warning(
-                    f"**{p['name']}**: no data for **{', '.join(dropped_elems)}** \u2014 "
-                    "dropped from their composite; slot re-split among remaining elements.")
-            if dropped_slots:
-                st.warning(
-                    f"**{p['name']}**: no data for **{', '.join(dropped_slots)}** \u2014 "
-                    "dropped; remaining weights renormalized: "
-                    + ", ".join(f"{t} {w:.1%}" for t, w in w_series.items()))
-
-            # Engine groups: element -> synthetic slot-id, only for composite slots
-            # that still have >1 surviving element. Empty => None => legacy path.
-            groups = {}
-            for si, live in slot_survivors.items():
-                if len(live) > 1:
-                    for t in live: groups[t] = f"__slot{si}"
-            groups = groups or None
-
-            # Bands (v2.5.0): slot label -> engine slot id (the ticker for a
-            # singleton, the synthetic id for a composite) so per-slot overrides
-            # reach the engine; symmetric configs collapse to the legacy scalar path.
-            label_to_id = {}
-            for si, live in slot_survivors.items():
-                label_to_id[slots[si][0]] = f"__slot{si}" if len(live) > 1 else live[0]
-            thr_dn, thr_up = build_band_thresholds(
-                p['thr'], p.get('thr_up'), p.get('slot_bands'), label_to_id)
+            # Dataless elements, renormalisation, composite groups and per-slot
+            # bands: backtest_core.prepare_portfolio (v2.6.0), shared with the
+            # live desk; messages unchanged.
+            prep = prepare_portfolio(p, p_tks, p_wts, p_comp, price_df)
+            if prep["error"]:
+                st.error(prep["error"]); continue
+            for _lvl, _msg in prep["notices"]:
+                (st.warning if _lvl == "warning" else st.info)(_msg)
+            valid_p_tks, w_series, groups = prep["valid_tks"], prep["w_series"], prep["groups"]
+            slots, slot_survivors = prep["slots"], prep["slot_survivors"]
+            thr_dn, thr_up = prep["thr_dn"], prep["thr_up"]
 
             res_df, cnt, pnl_rec, bt_stats = run_detailed_backtest(
                 p['strat'], price_df[valid_p_tks], w_series, init_f, thr_dn, groups=groups,
