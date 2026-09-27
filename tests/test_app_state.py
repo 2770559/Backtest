@@ -453,11 +453,41 @@ class ParseConfigTest(unittest.TestCase):
         p = cfg["portfolios"][0]
         self.assertEqual((p["thr"], p["thr_up"]), (200, 1))
         self.assertEqual(p["slot_bands"], {"SPY": {"down": 200, "up": 1}, "TLT": {"down": None, "up": 30}})
-        self.assertEqual(len(warns), 4, warns)          # Down, Up, SPY down / up (NaN inherits, as "abc" does)
+        self.assertEqual(len(warns), 5, warns)          # Down, Up, SPY down / up, TLT down (NaN inherits, reported)
         self.assertTrue(any("per-slot down band of **SPY** inf set to 200%" in w for w in warns), warns)
+        self.assertTrue(any("per-slot down band of **TLT** nan is not a number" in w for w in warns), warns)
         cfg, warns = app._parse_config(_cfg(portfolios=[dict(port, thr=float("nan"), thr_up=None, slot_bands={})]))
         self.assertEqual((cfg["portfolios"][0]["thr"], cfg["portfolios"][0]["thr_up"]), (38, 38))
         self.assertTrue(any("Down band nan set to 38%" in w for w in warns), warns)
+
+    def test_band_values_written_as_text_lists_or_huge_integers_are_read(self):
+        port = {"id": "a", "name": "P", "tickers": "SPY, TLT, GLD", "weights": "0.5, 0.3, 0.2",
+                "strat": "RelDiff Full", "thr": 10 ** 400, "thr_up": 50,
+                "slot_bands": {"SPY": {"down": "40%", "up": [80]}, "TLT": {"down": "abc", "up": -10 ** 400},
+                               "GLD": {"down": " 25 % ", "up": ""}}}
+        cfg, warns = app._parse_config(_cfg(portfolios=[port]))
+        p = cfg["portfolios"][0]
+        self.assertEqual((p["thr"], p["thr_up"]), (200, 50))
+        self.assertEqual(p["slot_bands"], {"SPY": {"down": 40, "up": 80}, "TLT": {"down": None, "up": 1},
+                                           "GLD": {"down": 25, "up": None}})
+        self.assertEqual(len(warns), 3, warns)          # Down, TLT down (no number), TLT up (clamped)
+        self.assertTrue(any("per-slot down band of **TLT** 'abc' is not a number" in w for w in warns), warns)
+        self.assertTrue(all(len(w) < 200 for w in warns), warns)     # a 400-digit value is cut, not printed
+        self.assertEqual(app._norm_band_pct(10 ** 400, 60), 200)
+        self.assertEqual(app._norm_band_pct(-10 ** 400, 60), 1)
+
+    def test_band_keys_follow_the_slot_labels(self):
+        """"brk.b", lower case or a composite's members in another order: the engine applies them to the slot
+        (backtest_core._band_key), so the config keeps them under the slot's label — no "unknown slot"."""
+        port = {"id": "a", "name": "P", "tickers": "BRK.B, (ETH-USD, MSTR), tlt", "weights": "0.5, 0.2, 0.3",
+                "strat": "RelDiff Full", "thr": 40,
+                "slot_bands": {"brk.b": {"down": 30}, "mstr+eth-usd": {"down": 60, "up": 90}, "XYZ": {"up": 20}}}
+        cfg, warns = app._parse_config(_cfg(portfolios=[port]))
+        self.assertEqual(cfg["portfolios"][0]["slot_bands"],
+                         {"BRK-B": {"down": 30, "up": None}, "ETH-USD+MSTR": {"down": 60, "up": 90},
+                          "XYZ": {"down": None, "up": 20}})
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn("unknown slot(s) **XYZ**", warns[0])
 
     def test_non_string_strategy_falls_back_with_a_warning(self):
         # A list / dict raised TypeError (unhashable) in the strategy lookup: the whole file was refused.

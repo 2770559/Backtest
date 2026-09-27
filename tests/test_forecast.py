@@ -369,6 +369,71 @@ class LoadActualTest(unittest.TestCase):
         self.assertEqual(len(fake.calls), 2)                   # inside the cooldown, but the entry expired
 
 
+class LoadActualLockTest(unittest.TestCase):
+    """The download ran under the lock that guards the cached entry: while one visitor forced a refresh, every
+    other visitor waited for Yahoo although the cache still held a valid entry."""
+
+    def setUp(self):
+        fc._actual_store.clear()
+        self._pause = fc.RETRY_PAUSE
+        fc.RETRY_PAUSE = 0
+
+    def tearDown(self):
+        fc.RETRY_PAUSE = self._pause
+        fc._actual_store.clear()
+
+    def test_a_valid_entry_is_served_during_another_visitors_download(self):
+        import threading
+        fc.load_actual(now=0, download=FakeYahoo())
+        started, release = threading.Event(), threading.Event()
+        slow = FakeYahoo()
+
+        def blocking(tickers, **kw):
+            started.set()
+            release.wait(10)
+            return slow(tickers, **kw)
+
+        t = threading.Thread(target=fc.load_actual,
+                             kwargs=dict(force=True, now=fc.REFRESH_COOLDOWN + 1, download=blocking))
+        t.start()
+        try:
+            self.assertTrue(started.wait(10))
+            done = []
+            reader = threading.Thread(target=lambda: done.append(fc.load_actual(now=5, download=FakeYahoo())))
+            reader.start()
+            reader.join(2)
+            self.assertEqual(len(done), 1, "the cached entry waited for another visitor's download")
+            self.assertEqual(sorted(done[0][0]), sorted(fc.TICKERS))
+        finally:
+            release.set()
+            t.join(10)
+        self.assertEqual(len(slow.calls), 1)
+
+    def test_visitors_of_an_expired_entry_share_one_download(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        fake = FakeYahoo()
+
+        def blocking(tickers, **kw):
+            started.set()
+            release.wait(10)
+            return fake(tickers, **kw)
+
+        first = threading.Thread(target=fc.load_actual, kwargs=dict(now=0, download=blocking))
+        first.start()
+        self.assertTrue(started.wait(10))
+        out = []
+        second = threading.Thread(target=lambda: out.append(fc.load_actual(now=1, download=blocking)))
+        second.start()
+        second.join(0.3)
+        self.assertTrue(second.is_alive())             # waits for the download under way ...
+        release.set()
+        first.join(10)
+        second.join(10)
+        self.assertEqual(len(fake.calls), 1)           # ... and is served its result, not a second download
+        self.assertEqual(sorted(out[0][0]), sorted(fc.TICKERS))
+
+
 class AppSmokeTest(unittest.TestCase):
     def run_app(self, fake):
         st.cache_resource.clear()
@@ -399,6 +464,14 @@ class AppSmokeTest(unittest.TestCase):
         warnings = " ".join(w.value for w in at.warning)
         self.assertIn("DBMF", warnings)
         self.assertIn("Too Many Requests", warnings)
+
+    def test_dollar_signs_of_failure_reasons_are_not_typeset(self):
+        at = self.run_app(FakeYahoo(failing={"DBMF": "YFTzMissingError('$DBMF: possibly delisted')",
+                                             "KMLM": "YFTzMissingError('$KMLM: possibly delisted')"}))
+        self.assertFalse(at.exception, at.exception)
+        warning = next(w.value for w in at.warning if "实际数据缺少资产" in w.value)
+        self.assertIn("\\$DBMF", warning)
+        self.assertNotIn(" $", warning.replace("\\$", ""))
 
     def test_total_failure_shows_predictions_only(self):
         at = self.run_app(FakeYahoo(raise_exc=ConnectionError("offline")))

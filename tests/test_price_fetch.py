@@ -85,9 +85,10 @@ class FakeYahoo:
     lists each ticker from `starts[tk]` (default 2019-12-01), skips `holidays`
     for every ticker, and records every call's ticker list."""
 
-    def __init__(self, failing=None, starts=None, holidays=()):
+    def __init__(self, failing=None, starts=None, holidays=(), ends=None):
         self.failing = dict(failing or {})
         self.starts = dict(starts or {})
+        self.ends = dict(ends or {})                      # ticker -> its last price date (delisted)
         self.holidays = tuple(holidays)
         self.calls = []
 
@@ -99,6 +100,7 @@ class FakeYahoo:
             if tk in self.failing:
                 continue
             s = _series(tk, start=self.starts.get(tk, "2019-12-01"), holidays=self.holidays)
+            s = s[s.index <= pd.Timestamp(self.ends.get(tk, s.index[-1]))]
             good[tk] = s[s.index >= pd.Timestamp(start)]
         failed = [tk for tk in tickers if tk in self.failing]
         yf.shared._ERRORS = {tk: self.failing[tk] for tk in failed}
@@ -583,6 +585,34 @@ class AppRegressionTest(unittest.TestCase):
         body = " ".join(m.value for m in at.markdown)
         self.assertIn("sum-card", body)
         self.assertNotIn("Port C", " ".join(w.value for w in at.warning))
+
+    def test_prices_that_end_early_are_reported(self):
+        """A delisted or renamed ticker's last price was carried flat to the end of the backtest in silence."""
+        at = self._run(FakeYahoo(ends={"DBMF": "2021-02-26"}))
+        self.assertFalse(at.exception)
+        warnings = " | ".join(w.value for w in at.warning)
+        self.assertIn("Prices end early for **DBMF** (2021-02-26)", warnings)
+        self.assertIn("sum-card", " ".join(m.value for m in at.markdown))       # the run itself goes on
+        st.cache_resource.clear()                                                  # the cut series is cached
+        at = self._run(FakeYahoo())
+        self.assertNotIn("Prices end early", " | ".join(w.value for w in at.warning))
+
+    def test_dollar_names_and_bands_asymmetric_ignores(self):
+        """Review 3 online low-2: two "$" of a portfolio name were typeset as LaTeX in the tabs and the per-slot band
+        expander. Review 4: Asymmetric RelDiff ignores per-slot bands, and says so."""
+        ports = _two_port_config()
+        ports[0]["name"] = "US$ $Plan"
+        ports[1]["slot_bands"] = {"ETH-USD": {"down": 40, "up": 40}}
+        at = AppTest.from_file(APP, default_timeout=120)
+        at.session_state["portfolios_list"] = ports
+        at.session_state["run_backtest"] = True
+        with patch.object(yf, "download", FakeYahoo()):
+            at.run()
+        self.assertFalse(at.exception)
+        self.assertIn("US\\$ \\$Plan", [t.label for t in at.tabs])
+        self.assertIn("Per-slot bands · US\\$ \\$Plan", [e.label for e in at.expander])
+        infos = " | ".join(i.value for i in at.info)
+        self.assertIn("**Port B**: per-slot bands apply to the RelDiff strategies only", infos)
 
     def test_rate_limited_benchmark_reports_the_cause(self):
         fake = FakeYahoo(failing={"SPY": RATE_LIMITED})

@@ -28,7 +28,7 @@ try:
 except ImportError:            # optional dependency: browser-persisted default disabled
     HAS_JS_EVAL = False
 
-EXPECTED_CORE = "2026-09-27a"         # = backtest_core.CORE_VERSION
+EXPECTED_CORE = "2026-09-27b"         # = backtest_core.CORE_VERSION
 
 
 def _fresh_core():
@@ -55,14 +55,14 @@ from backtest_core import (
     scrub_leading_glitches, scrub_isolated_spikes, sample_monthly,
     _split_top_level, slot_labels, normalize_slot_bands, build_band_thresholds,
     BAND_MODE_REL, BAND_MODE_RATIO, BAND_MODES,
-    band_trigger_weights, align_price_data, prepare_portfolio,
+    band_trigger_weights, align_price_data, prepare_portfolio, _band_key,
 )
 
 # Band mode (v2.5.2) as shown in the portfolio row: what Down % / Up % measure.
 BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
 
 # --- Version ---
-APP_VERSION = "2.8.1"  # semver: major.minor.patch
+APP_VERSION = "2.8.2"  # semver: major.minor.patch
 APP_BUILD_DATE = "2026-09-27"
 
 # --- 1. Page Config ---
@@ -388,6 +388,8 @@ def _norm_band_pct(v, fallback):
         return fallback
     try:
         f = float(v)
+    except OverflowError:                        # an integer too large for a float: out of range all the same
+        f = math.inf if v > 0 else -math.inf
     except (TypeError, ValueError):
         return fallback
     if math.isnan(f):
@@ -422,7 +424,7 @@ def _stated_but_changed(raw, kept):
         return False
     try:
         return float(raw) != float(kept)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):     # an integer too large for a float was not kept either
         return True
 
 
@@ -438,9 +440,16 @@ def _negative_weights(weights_str):
     return neg
 
 
+def _short_repr(v, n=24):
+    """repr() cut to n characters for a warning: a hand-edited 400-digit band was printed in full."""
+    r = repr(v)
+    return r if len(r) <= n else r[:n - 1] + "…"
+
+
 def _clamp_infinite_slot_bands(raw, name, warns):
-    """±Infinity in a hand-edited per-slot band (JSON accepts it) -> the editor's 200 / 1, reported (appended to
-    `warns`); it has no percent integer, and normalize_slot_bands raised OverflowError on it. Other values pass
+    """A hand-edited per-slot band made readable: ±Infinity (JSON accepts it) or an integer too large for a float
+    -> the editor's 200 / 1, reported; "40%" -> 40 and [40] -> 40, silently (the intent is plain); a value that
+    is no number (NaN included) -> inherits the portfolio band, reported (appended to `warns`). Other values pass
     through untouched for normalize_slot_bands."""
     if not isinstance(raw, dict):
         return raw
@@ -450,14 +459,25 @@ def _clamp_infinite_slot_bands(raw, name, warns):
             band = dict(band)
             for side in ("down", "up"):
                 v = band.get(side)
+                if isinstance(v, (list, tuple)) and len(v) == 1:
+                    v = band[side] = v[0]
+                if isinstance(v, str) and v.strip().endswith("%"):
+                    v = band[side] = v.strip()[:-1].strip()
                 try:
                     f = float(v)
+                except OverflowError:
+                    f = math.inf if v > 0 else -math.inf
                 except (TypeError, ValueError):
-                    continue
-                if math.isinf(f):
+                    f = None if v is None or (isinstance(v, str) and not v.strip()) else math.nan
+                if f is not None and math.isnan(f):
+                    warns.append(f"**{name}**: per-slot {side} band of **{_md_text(str(label).strip())}** "
+                                 f"{_md_text(_short_repr(v))} is not a number — it inherits the portfolio band.")
+                    band[side] = None
+                elif f is not None and math.isinf(f):
                     band[side] = 200 if f > 0 else 1
                     warns.append(f"**{name}**: per-slot {side} band of **{_md_text(str(label).strip())}** "
-                                 f"{_md_text(repr(v))} set to {band[side]}% (bands run 1–200%, like the editor's).")
+                                 f"{_md_text(_short_repr(v))} set to {band[side]}% (bands run 1–200%, like the "
+                                 "editor's).")
         out[label] = band
     return out
 
@@ -490,9 +510,11 @@ def _parse_config(loaded_config):
         p['thr_up'] = _norm_band_pct(p.get('thr_up'), p['thr'])
         for key, side in (('thr', "Down"), ('thr_up', "Up")):
             if _stated_but_changed(raw.get(key), p[key]):
-                warns.append(f"**{name}**: {side} band {_md_text(repr(raw.get(key)))} set to {p[key]}% "
+                warns.append(f"**{name}**: {side} band {_md_text(_short_repr(raw.get(key)))} set to {p[key]}% "
                              "(bands run 1–200%).")
         p['slot_bands'] = normalize_slot_bands(_clamp_infinite_slot_bands(p.get('slot_bands'), name, warns))
+        canon = {_band_key(x): x for x in slot_labels(p['tickers'])}   # "brk.b" -> "BRK-B": the editor's rows
+        p['slot_bands'] = {canon.get(_band_key(k), k): b for k, b in p['slot_bands'].items()}
         for label, band in p['slot_bands'].items():
             for side in ("down", "up"):
                 v = band[side]
@@ -1305,7 +1327,7 @@ def render_slot_band_editors(ports):
         # the first override is synced would re-render the block around the
         # editor mid-edit. The user's own toggling is client-side and sticks.
         _exp = st.session_state.setdefault('_sb_expanded', {})
-        with st.expander(f"Per-slot bands · {p['name']}",
+        with st.expander(f"Per-slot bands · {_md_text(p['name'])}",
                          expanded=_exp.setdefault(p['id'], bool(p.get('slot_bands')))):
             st.caption(
                 "Override the Down / Up band for individual slots — e.g. keep a volatile "
@@ -1793,7 +1815,7 @@ with st.container(border=True):
             if _toks and (_bad or len(_wr) != len(_toks)):
                 _lossy.append(p['name'])
         if _lossy:
-            st.warning("**" + ", ".join(_lossy) + "**: weights don't align with tickers "
+            st.warning("**" + ", ".join(_md_text(x) for x in _lossy) + "**: weights don't align with tickers "
                        "(count mismatch or unparseable value). Misaligned tickers show a "
                        "blank weight below and drop from the stored config when the matrix "
                        "syncs — fill their weights now or re-import a corrected JSON.")
@@ -1877,8 +1899,8 @@ with st.container(border=True):
                  'code — type just the code when adding; the label is display-only.')}
         for p in ports:
             col_cfg[p['name']] = st.column_config.NumberColumn(
-                p['name'], min_value=0.0, max_value=100.0, step=0.5, format="%.2f%%",
-                help=f"Target weight of each asset in {p['name']}, in percent.")
+                p['name'], min_value=0.0, max_value=100.0, step=0.01, format="%.2f%%",
+                help=f"Target weight of each asset in {_md_text(p['name'])}, in percent.")
 
         edited_alloc = st.data_editor(
             st.session_state['_alloc_base'], key=alloc_key, num_rows="dynamic",
@@ -1888,7 +1910,7 @@ with st.container(border=True):
         sums = []
         for p in ports:
             total = float(pd.to_numeric(edited_alloc[p['name']], errors='coerce').fillna(0).sum())
-            ok = abs(total - 100) < 0.01
+            ok = abs(total - 100) < 0.005                 # shows as 100.00: the engine scales it silently
             color, mark = ('var(--good)', '✓') if ok else ('var(--bad)', '≠ 100%')
             sums.append(f'<span style="color:{color};font-weight:600">{html.escape(str(p["name"]))}: '
                         f'{total:.4g}% {mark}</span>')
@@ -1982,6 +2004,11 @@ if st.session_state.run_backtest:
         aligned = align_price_data(price_data, bench_tk, start_d, all_port_tks)
         if aligned["notice"]:
             (st.warning if aligned["notice"][0] == "warning" else st.info)(aligned["notice"][1])
+        if aligned.get("ended"):
+            st.warning("Prices end early for " + ", ".join(f"**{_md_text(t)}** ({d.date()})"
+                                                           for t, d in sorted(aligned["ended"].items()))
+                       + " — carried flat from there to the end of the backtest, which keeps trading them at that "
+                         "last price (delisted, renamed or merged?).")
         if aligned["error"]:
             st.error(aligned["error"]); st.stop()
         actual_start_day = aligned["actual_start_day"]
@@ -2023,7 +2050,7 @@ if st.session_state.run_backtest:
             res_df, cnt, pnl_rec, bt_stats = run_detailed_backtest(
                 p['strat'], price_df[valid_p_tks], w_series, init_f, thr_dn, groups=groups,
                 threshold_up=thr_up, return_stats=True,
-                band_mode=p.get('band_mode', BAND_MODE_REL))
+                band_mode=p.get('band_mode', BAND_MODE_REL), size_weights=prep.get("size_weights"))
             if not res_df.empty:
                 # For each surviving composite slot, add an aggregate weight column.
                 # Element columns keep their OWN ticker name (no slot prefix \u2014 keeps
@@ -2267,7 +2294,7 @@ if st.session_state.run_backtest:
         if res_list:
             st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
             tab_names = list(res_list.keys())
-            tabs = st.tabs(tab_names)
+            tabs = st.tabs([_md_text(n) for n in tab_names])
             for tab, lbl in zip(tabs, tab_names):
                 with tab:
                     _s = port_stats.get(lbl)

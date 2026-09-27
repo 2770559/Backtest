@@ -245,11 +245,13 @@ _RATE_LIMIT_MARKERS = ("rate limit", "too many requests")
 
 @st.cache_resource(show_spinner=False)
 def _actual_store():
-    """Process-wide singleton: {"lock", "entry": {expires, closes, failures, stale},
-    "forced_at": time of the last forced refresh}. The lock also serializes
-    yf.download, whose per-ticker errors land in module-global state
-    (yf.shared._ERRORS)."""
-    return {"lock": threading.Lock(), "entry": None, "forced_at": None}
+    """Process-wide singleton: {"lock", "dl_lock", "entry": {expires, closes,
+    failures, stale}, "forced_at": time of the last forced refresh}. "lock"
+    guards the entry and is held only to read or write it; "dl_lock"
+    serializes the downloads — yf.download's per-ticker errors land in
+    module-global state (yf.shared._ERRORS) — so a visitor whose cached entry is
+    still valid never waits for another visitor's download."""
+    return {"lock": threading.Lock(), "dl_lock": threading.Lock(), "entry": None, "forced_at": None}
 
 
 def refresh_wait(now=None):
@@ -311,23 +313,34 @@ def load_actual(force=False, now=None, download=None):
     download = download or yf.download
     now = time.time() if now is None else now
     store = _actual_store()
+
+    def served(e):
+        return dict(e["closes"]), dict(e["failures"]), list(e["stale"])
     with store["lock"]:
         e = store["entry"]
         if force and refresh_wait(now) > 0:
             force = False
         if force:
             store["forced_at"] = now
-        if force or e is None or e["expires"] <= now:
-            try:
-                good, bad = _download_closes(TICKERS, download)
-                retry = [tk for tk, why in bad.items() if not _is_rate_limited(why)]
-                if retry:
-                    time.sleep(RETRY_PAUSE)
-                    good2, bad2 = _download_closes(retry, download)
-                    good.update(good2)
-                    bad = {tk: why for tk, why in {**bad, **bad2}.items() if tk not in good}
-            except Exception as exc:  # network down, yfinance internals, ...
-                good, bad = {}, {tk: _tidy_reason(exc) for tk in TICKERS}
+        if not force and e is not None and e["expires"] > now:
+            return served(e)
+    with store["dl_lock"]:                               # one download at a time, the cache free meanwhile
+        with store["lock"]:
+            e = store["entry"]
+            if not force and e is not None and e["expires"] > now:
+                return served(e)                         # another visitor's download just renewed it
+        try:
+            good, bad = _download_closes(TICKERS, download)
+            retry = [tk for tk, why in bad.items() if not _is_rate_limited(why)]
+            if retry:
+                time.sleep(RETRY_PAUSE)
+                good2, bad2 = _download_closes(retry, download)
+                good.update(good2)
+                bad = {tk: why for tk, why in {**bad, **bad2}.items() if tk not in good}
+        except Exception as exc:  # network down, yfinance internals, ...
+            good, bad = {}, {tk: _tidy_reason(exc) for tk in TICKERS}
+        with store["lock"]:
+            e = store["entry"]
             prev = e["closes"] if e else {}
             stale = [tk for tk in bad if tk in prev]
             closes = {**{tk: prev[tk] for tk in stale}, **good}
@@ -335,7 +348,7 @@ def load_actual(force=False, now=None, download=None):
             ttl = ACTUAL_TTL if not bad else ACTUAL_RETRY_TTL
             e = store["entry"] = {"expires": now + ttl, "closes": closes,
                                   "failures": failures, "stale": stale}
-        return dict(e["closes"]), dict(e["failures"]), list(e["stale"])
+            return served(e)
 
 
 def cumulative_returns(closes):
@@ -595,8 +608,9 @@ section.main > div { max-width: 1400px; margin: 0 auto; }
                        "数据本身每小时自动更新")
     if actual is not None and missing:
         why = "；".join(f"{a}: {failures[a]}" for a in missing if a in failures)
-        st.warning("实际数据缺少资产: " + ", ".join(missing) + "（组合线已按剩余权重归一化）"
-                   + (f" — {why}" if why else ""))
+        # Yahoo's reasons ("$DBMF: possibly delisted…"): "$" escaped, or two of them are typeset as LaTeX
+        st.warning(("实际数据缺少资产: " + ", ".join(missing) + "（组合线已按剩余权重归一化）"
+                    + (f" — {why}" if why else "")).replace("$", "\\$"))
     if stale:
         st.caption("ℹ️ 本次刷新未取到 " + ", ".join(stale) + "，暂用上次成功的数据，2 分钟后自动重试")
 

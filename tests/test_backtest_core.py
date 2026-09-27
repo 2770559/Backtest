@@ -408,6 +408,78 @@ class AlignPrepareTest(unittest.TestCase):
             if shown:
                 self.assertIn(f"weights add up to {shown}", msgs[0])
 
+    def test_asymmetric_ignores_per_slot_bands_and_says_so(self):
+        price_df = align_price_data(_prices(), "SPY", "2020-01-01", ["A", "B", "C"])["price_df"]
+        base = {"name": "P", "tickers": "A, B, C", "weights": "0.5, 0.3, 0.2", "thr": 60, "thr_up": 100,
+                "slot_bands": {"B": {"down": 40, "up": 40}}}
+        tks, wts, errs, comp = parse_portfolio(base)
+        out = prepare_portfolio({**base, "strat": STRAT_ASYM}, tks, wts, comp, price_df)
+        self.assertEqual((out["thr_dn"], out["thr_up"]), (0.6, 1.0))           # the portfolio band only
+        self.assertTrue(any("per-slot bands apply to the RelDiff strategies only" in m and STRAT_ASYM in m
+                            for _, m in out["notices"]))
+        for strat in (STRAT_RD_FULL, STRAT_RD_MIXED, None):                    # None: an old config, RelDiff
+            p = dict(base, strat=strat) if strat else dict(base)
+            out = prepare_portfolio(p, tks, wts, comp, price_df)
+            self.assertEqual(out["thr_dn"], {"*": 0.6, "B": 0.4}, strat)
+            self.assertFalse(any("per-slot bands" in m for _, m in out["notices"]), strat)
+        out = prepare_portfolio({**base, "strat": STRAT_ASYM, "slot_bands": {}}, tks, wts, comp, price_df)
+        self.assertFalse(any("per-slot bands" in m for _, m in out["notices"]))  # nothing to ignore: no notice
+
+    def test_size_weights_are_the_weights_as_entered(self):
+        price_df = align_price_data(_prices(), "SPY", "2020-01-01", ["A", "B", "C"])["price_df"]
+        p = {"name": "P", "tickers": "A, B, C", "weights": "0.1, 0.5, 0.405", "thr": 40}     # 100.5%
+        tks, wts, errs, comp = parse_portfolio(p)
+        out = prepare_portfolio(p, tks, wts, comp, price_df)
+        self.assertEqual(list(out["size_weights"]), [0.1, 0.5, 0.405])
+        self.assertAlmostEqual(out["w_series"]["A"], 0.1 / 1.005)                # < 10%: scaled below the cut-off
+        p = {"name": "P", "tickers": "A, B, C", "weights": "0.1, 0.5, 0.4", "thr": 40}
+        tks, wts, errs, comp = parse_portfolio(p)
+        self.assertIsNone(prepare_portfolio(p, tks, wts, comp, price_df)["size_weights"])   # 100%: the targets
+
+    def test_size_cut_offs_read_the_weights_as_entered(self):
+        """Mixed resets every slot when a slot of 10% or more breaches, Asymmetric treats slots under 6% as
+        minor: a sum of 100.5% scaled a 10% / 6% slot just under the cut-off and changed the rebalance."""
+        idx = pd.date_range("2020-01-31", periods=3, freq="ME")
+        price = pd.DataFrame({"A": [100, 200, 200], "B": [100, 100, 100], "C": [100, 100, 100]}, index=idx)
+        entered = pd.Series([0.1, 0.5, 0.405], index=price.columns)
+        run = lambda strat, w, **kw: run_detailed_backtest(strat, price, w, 10000, 0.4, return_stats=True, **kw)
+        scope = lambda st: [e["scope"] for e in st["rebal_events"]]
+        self.assertEqual(scope(run(STRAT_RD_MIXED, entered / entered.sum())[3]), ["local"])     # before: minor
+        self.assertEqual(scope(run(STRAT_RD_MIXED, entered / entered.sum(), size_weights=entered)[3]), ["global"])
+        price = pd.DataFrame({"A": [100, 160, 160], "B": [100, 100, 100], "C": [100, 100, 100]}, index=idx)
+        entered = pd.Series([0.06, 0.5, 0.445], index=price.columns)
+        self.assertEqual(run(STRAT_ASYM, entered / entered.sum())[1], 0)           # minor: needs +100% to trigger
+        self.assertEqual(run(STRAT_ASYM, entered / entered.sum(), size_weights=entered)[1], 1)   # major: +40%
+        h1 = run(STRAT_RD_MIXED, entered / entered.sum())[0]                       # None: the targets, as before
+        h2 = run(STRAT_RD_MIXED, entered / entered.sum(), size_weights=None)[0]
+        pd.testing.assert_frame_equal(h1, h2)
+
+    def test_nav_is_a_reserved_ticker(self):
+        for tickers, weights in (("nav, A", "0.5, 0.5"), ("A, (NAV, B)", "0.5, 0.5")):
+            tks, wts, errs, comp = parse_portfolio({"name": "P", "tickers": tickers, "weights": weights, "thr": 40})
+            self.assertTrue(any("NAV is the name of a column of the results table" in e for e in errs), errs)
+        tks, wts, errs, comp = parse_portfolio({"name": "P", "tickers": "NAVI, A", "weights": "0.5, 0.5", "thr": 40})
+        self.assertEqual(errs, [])
+
+    def test_per_slot_band_keys_match_like_tickers(self):
+        from backtest_core import build_band_thresholds
+        ids = {"BRK-B": "BRK-B", "A": "A", "ETH-USD+MSTR": "__slot2"}
+        dn, up = build_band_thresholds(60, 100, {"brk.b": {"down": 40}, " a ": {"up": 80},
+                                                 "mstr+eth-usd": {"down": 30, "up": 50}}, ids)
+        self.assertEqual(dn, {"*": 0.6, "BRK-B": 0.4, "__slot2": 0.3})
+        self.assertEqual(up, {"*": 1.0, "A": 0.8, "__slot2": 0.5})
+        dn, up = build_band_thresholds(60, 100, {"XYZ": {"down": 40}}, ids)      # still unknown: ignored
+        self.assertEqual((dn, up), (0.6, 1.0))
+
+    def test_prices_that_end_early_are_reported(self):
+        df = _prices()
+        df.loc[df.index > pd.Timestamp("2020-10-01"), "B"] = np.nan                # delisted in October
+        df.loc[df.index > pd.Timestamp(df.index[-5]), "C"] = np.nan                  # a few days: a holiday
+        out = align_price_data(df, "SPY", "2020-01-01", ["A", "B", "C"])
+        self.assertEqual(out["ended"], {"B": pd.Timestamp("2020-10-01")})
+        self.assertTrue(np.isfinite(out["price_df"]["B"].iloc[-1]))                   # still carried flat
+        self.assertEqual(align_price_data(_prices(), "SPY", "2020-01-01", ["A", "B"])["ended"], {})
+
     def test_app_reloads_a_stale_engine(self):
         import backtest_core
         app = (Path(__file__).resolve().parent.parent / "backtest_app.py").read_text(encoding="utf-8")

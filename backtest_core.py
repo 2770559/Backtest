@@ -8,12 +8,12 @@ import pandas as pd
 
 # Bumped with every change to the engine's results or messages; backtest_app reloads a stale module whose stamp
 # differs (Streamlit Cloud can keep the old module across a push).
-CORE_VERSION = "2026-09-27a"
+CORE_VERSION = "2026-09-27b"
 
 # prepare_portfolio scales weights that do not add up to 100% (more than float noise off) to 100%; it says
 # so only from this distance on, the allocation matrix's own "✓ 100%" tolerance (0.01 percentage points):
 # a sum the matrix shows as 100% ✓ (e.g. 33.333333% x 3) is scaled silently.
-WEIGHT_SUM_NOTICE_TOL = 1e-4
+WEIGHT_SUM_NOTICE_TOL = 5e-5          # a sum the matrix shows as ≠ 100.00% (it rounds to hundredths) is reported
 
 # Strategy name constants
 STRAT_BH       = "Buy & Hold"
@@ -23,6 +23,8 @@ STRAT_RD_LOCAL = "RelDiff Local"           # Relative-diff local rebalance
 STRAT_RD_MIXED = "RelDiff Mixed"           # Relative-diff mixed rebalance
 STRAT_RD_FULL  = "RelDiff Full"            # Relative-diff global rebalance
 STRAT_ASYM     = "Asymmetric RelDiff"      # Asymmetric relative-diff rebalance
+RELDIFF_STRATS = (STRAT_RD_FULL, STRAT_RD_MIXED, STRAT_RD_LOCAL)   # the strategies with Up / Down and per-slot bands
+RESERVED_TICKERS = frozenset({"NAV"})    # a column of the engine's history rows (tickers are upper case: Date / Type are not)
 
 # Legacy (Chinese) strategy names from configs exported by v1.0.x
 STRAT_LEGACY_MAP = {
@@ -143,6 +145,9 @@ def parse_portfolio(port):
 
     w_raw = [x.strip() for x in w_str.split(',') if x.strip()]
     flat_now = [t for grp in slot_members for t in grp]
+    clash = sorted({t for t in flat_now if t in RESERVED_TICKERS})
+    if clash:                           # the results table has a NAV column: a ticker of that name overwrote it
+        errors.append(", ".join(clash) + " is the name of a column of the results table — this ticker cannot be used")
 
     # Count check is SLOT-level (one weight per slot, not per element).
     if len(slot_labels) != len(w_raw):
@@ -246,6 +251,12 @@ def normalize_slot_bands(raw):
     return out
 
 
+def _band_key(label):
+    """A per-slot band key in the form of the slot labels, order of a composite's members left out:
+    "brk.b" -> "BRK-B", "MSTR+eth-usd" -> "ETH-USD+MSTR"."""
+    return "+".join(sorted(clean_ticker(x) for x in str(label).split("+") if x.strip()))
+
+
 def build_band_thresholds(thr_pct, thr_up_pct, slot_bands, label_to_id):
     """Translate a portfolio's band config (percent integers) into the engine's
     (threshold, threshold_up) arguments (fractions).
@@ -265,8 +276,11 @@ def build_band_thresholds(thr_pct, thr_up_pct, slot_bands, label_to_id):
     down = float(thr_pct) / 100.0
     up = float(thr_pct if thr_up_pct is None else thr_up_pct) / 100.0
     d_over, u_over = {}, {}
+    canon = {_band_key(k): k for k in label_to_id}          # BRK.B, lower case, members in another order
     for label, band in (slot_bands or {}).items():
         sid = label_to_id.get(label)
+        if sid is None:
+            sid = label_to_id.get(canon.get(_band_key(label)))
         if sid is None or not isinstance(band, dict):
             continue
         if band.get("down") is not None:
@@ -316,12 +330,14 @@ def align_price_data(price_data, bench_tk, start_d, port_tickers):
     port_tickers : every portfolio element (decides a late-listing start)
 
     Returns {"final_data", "price_df", "market_start_day", "actual_start_day",
-    "notice": (level, text) | None, "error": text | None}. price_df is the
+    "notice": (level, text) | None, "error": text | None, "ended": {ticker:
+    its last price date} for the portfolio tickers whose prices stop more than
+    10 days before the benchmark's (carried flat to the end)}. price_df is the
     month-end sampled frame the engine runs on (the daily frame when the
     window is shorter than 90 days). Messages are the app's, verbatim.
     """
     out = {"final_data": None, "price_df": None, "market_start_day": None,
-           "actual_start_day": None, "notice": None, "error": None}
+           "actual_start_day": None, "notice": None, "error": None, "ended": {}}
     bench_valid_days = price_data[bench_tk].dropna().index
     future_days = bench_valid_days[bench_valid_days >= pd.Timestamp(start_d)]
     if future_days.empty:
@@ -330,6 +346,11 @@ def align_price_data(price_data, bench_tk, start_d, port_tickers):
                         "\u2014 delisted? Pick another benchmark.")
         return out
     market_start_day = future_days[0]
+
+    last_day = bench_valid_days[-1]
+    ends = {t: price_data[t].last_valid_index() for t in port_tickers if t in price_data.columns}
+    out["ended"] = {t: pd.Timestamp(d) for t, d in ends.items()           # delisted, renamed: filled flat below
+                    if d is not None and (last_day - pd.Timestamp(d)).days > 10}
 
     # ffill on full calendar first so weekend crypto prices carry to next trading day
     price_data_prefilled = price_data.ffill()
@@ -382,11 +403,13 @@ def prepare_portfolio(p, p_tks, p_wts, p_comp, price_df):
     dropped, build the engine groups for composites and the per-slot bands.
 
     Returns {"valid_tks", "w_series", "groups", "slots", "slot_survivors",
-    "label_to_id", "thr_dn", "thr_up", "notices": [(level, text)], "error"}.
+    "label_to_id", "thr_dn", "thr_up", "size_weights" (the weights as entered
+    when they were scaled to 100%, else None: run_detailed_backtest's size
+    cut-offs), "notices": [(level, text)], "error"}.
     Messages are the app's, verbatim.
     """
     out = {"valid_tks": [], "w_series": None, "groups": None, "slots": [], "slot_survivors": {},
-           "label_to_id": {}, "thr_dn": None, "thr_up": None, "notices": [], "error": None}
+           "label_to_id": {}, "thr_dn": None, "thr_up": None, "size_weights": None, "notices": [], "error": None}
     has_data = lambda t: t in price_df.columns and not price_df[t].isna().all()
 
     # Slot view: composite metadata if present, else one singleton per element.
@@ -427,11 +450,13 @@ def prepare_portfolio(p, p_tks, p_wts, p_comp, price_df):
             return out
         w_series = w_series / w_series.sum()
     total_w = float(w_series.sum())
+    size_weights = None                               # the weights as entered, for the engine's size cut-offs
     if not (dropped_elems or dropped_slots) and total_w > 0 and abs(total_w - 1.0) > 1e-9:
+        size_weights = w_series.copy()
         # Validation lets weights add up to 99-101%; a full rebalance to targets that do not add up to 100%
         # would create or destroy money every time. Exactly-100% inputs stay byte-identical (legacy engine).
         w_series = w_series / total_w
-        if abs(total_w - 1.0) >= WEIGHT_SUM_NOTICE_TOL:
+        if abs(total_w - 1.0) > WEIGHT_SUM_NOTICE_TOL:
             out["notices"].append(("info", f"**{p['name']}**: weights add up to {total_w:.2%} \u2014 scaled to 100%."))
     if dropped_elems:
         out["notices"].append(("warning",
@@ -455,8 +480,14 @@ def prepare_portfolio(p, p_tks, p_wts, p_comp, price_df):
     label_to_id = {}
     for si, live in slot_survivors.items():
         label_to_id[slots[si][0]] = f"__slot{si}" if len(live) > 1 else live[0]
-    thr_dn, thr_up = build_band_thresholds(p['thr'], p.get('thr_up'), p.get('slot_bands'), label_to_id)
-    out.update(w_series=w_series, groups=groups or None, label_to_id=label_to_id, thr_dn=thr_dn, thr_up=thr_up)
+    rel = p.get('strat') is None or p.get('strat') in RELDIFF_STRATS   # per-slot bands: the RelDiff strategies
+    if p.get('slot_bands') and not rel:
+        out["notices"].append(("info", f"**{p['name']}**: per-slot bands apply to the RelDiff strategies only "
+                                       f"\u2014 not used by {p.get('strat')}."))
+    thr_dn, thr_up = build_band_thresholds(p['thr'], p.get('thr_up'), p.get('slot_bands') if rel else None,
+                                           label_to_id)
+    out.update(w_series=w_series, groups=groups or None, label_to_id=label_to_id, thr_dn=thr_dn, thr_up=thr_up,
+               size_weights=size_weights)
     return out
 
 
@@ -598,7 +629,7 @@ def _empty_stats():
 
 def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                           threshold, groups=None, threshold_up=None, return_stats=False,
-                          band_mode=BAND_MODE_REL):
+                          band_mode=BAND_MODE_REL, size_weights=None):
     """Backtest one portfolio under one rebalance strategy.
 
     groups: optional element-ticker -> slot-id mapping (dict[str, str]). Elements
@@ -630,6 +661,11 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
     (U = 100% = "the slot doubled against the rest", D = 50% = "it halved").
     Per-slot bands are read in the same mode. Only the RelDiff strategies use it;
     Asymmetric RelDiff, Periodic and Buy & Hold ignore it.
+
+    size_weights: the element weights as entered, before prepare_portfolio scaled
+    them to 100% (None: the targets): the major / minor cut-offs of RelDiff Mixed
+    (10%) and Asymmetric RelDiff (6%) read the slot sizes from them, so a sum of
+    100.5% does not turn a 10% slot into a minor one.
 
     return_stats: when True a 4th value is returned, a dict with turnover and
     drift statistics:
@@ -679,6 +715,8 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
     # Slot-level targets = SUM of member element targets (singleton -> itself).
     slot_targets = target_weights.groupby(slot_of).sum().reindex(slot_ids)
+    slot_sizes = slot_targets if size_weights is None else \
+        pd.Series(size_weights, dtype=float).reindex(tickers).fillna(0.0).groupby(slot_of).sum().reindex(slot_ids)
 
     # Normalize bands: scalar stays scalar (broadcasts bit-identically);
     # a dict becomes a Series aligned to slot_ids ("*" = default band).
@@ -762,8 +800,8 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
 
         elif strategy_name == STRAT_ASYM:
             diff_ratio = (slot_weights - slot_targets) / slot_targets.replace(0, 1e-9)
-            mask_major = slot_targets >= 0.06
-            mask_minor = slot_targets < 0.06
+            mask_major = slot_sizes >= 0.06
+            mask_minor = slot_sizes < 0.06
 
             trigger_major = mask_major & (np.abs(diff_ratio) > threshold)
             trigger_minor_up = mask_minor & (diff_ratio > threshold * 2.5)
@@ -789,7 +827,7 @@ def run_detailed_backtest(strategy_name, price_df, target_weights, initial_cap,
                 if strategy_name == STRAT_RD_FULL:
                     new_slot_values, reset_slots, do_rebalance = total_val * slot_targets, set(slot_ids), True
                 elif strategy_name == STRAT_RD_MIXED:
-                    if ((slot_targets >= 0.1) & breach).any():
+                    if ((slot_sizes >= 0.1) & breach).any():
                         new_slot_values, reset_slots = total_val * slot_targets, set(slot_ids)
                     else:
                         new_slot_values, reset_slots = apply_local_rebalance(
