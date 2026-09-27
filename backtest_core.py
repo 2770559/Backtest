@@ -6,6 +6,10 @@ unit-tested and reused outside the app.
 import numpy as np
 import pandas as pd
 
+# Bumped with every change to the engine's results; backtest_app reloads a stale module whose stamp differs
+# (Streamlit Cloud can keep the old module across a push).
+CORE_VERSION = "2026-09-26b"
+
 # Strategy name constants
 STRAT_BH       = "Buy & Hold"
 STRAT_ANNUAL   = "Periodic (Annual)"       # Rebalance every 365 days
@@ -146,10 +150,18 @@ def parse_portfolio(port):
     except ValueError:
         errors.append("invalid weight format")
         return flat_now, [], errors, None
+    if not np.isfinite(slot_targets).all():      # "nan" / "inf" parse as floats ("nan" slipped past the sum check)
+        errors.append("invalid weight format")
+        return flat_now, [], errors, None
 
     total_w = sum(slot_targets)
     if abs(total_w - 1.0) > 0.01:
         errors.append(f"weights sum = {total_w:.2f}, should be 1.0")
+
+    # Only the sum used to be checked: "-0.2, 1.2" passed and ran a short position.
+    negative = [lbl for lbl, w in zip(slot_labels, slot_targets) if w < 0]
+    if negative:
+        errors.append("negative weight(s): " + ", ".join(negative))
 
     # Duplicate detection across ALL elements (flat, cross-slot).
     dupes = sorted({t for t in flat_now if flat_now.count(t) > 1})
@@ -407,6 +419,12 @@ def prepare_portfolio(p, p_tks, p_wts, p_comp, price_df):
                             f"after dropping dataless ones \u2014 portfolio skipped.")
             return out
         w_series = w_series / w_series.sum()
+    total_w = float(w_series.sum())
+    if not (dropped_elems or dropped_slots) and total_w > 0 and abs(total_w - 1.0) > 1e-9:
+        # Validation lets weights add up to 99-101%; a full rebalance to targets that do not add up to 100%
+        # would create or destroy money every time. Exactly-100% inputs stay byte-identical (legacy engine).
+        w_series = w_series / total_w
+        out["notices"].append(("info", f"**{p['name']}**: weights add up to {total_w:.2%} \u2014 scaled to 100%."))
     if dropped_elems:
         out["notices"].append(("warning",
             f"**{p['name']}**: no data for **{', '.join(dropped_elems)}** \u2014 "
@@ -449,7 +467,7 @@ def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
         ann_return = (1 + total_return) ** (1 / years) - 1
         rolling_max = nav.cummax()
         max_dd = ((nav - rolling_max) / rolling_max).min()
-        daily_ret = nav.pct_change().dropna()
+        period_ret = nav.pct_change().dropna()
         median_gap = np.median(np.diff(nav.index).astype('timedelta64[D]').astype(int))
         if median_gap <= 5:
             ann_factor = 252
@@ -457,8 +475,11 @@ def calculate_metrics(nav_series, rebalance_count, risk_free_rate=0.02):
             ann_factor = 52
         else:
             ann_factor = 12
-        ann_vol = daily_ret.std() * np.sqrt(ann_factor)
-        sharpe = (ann_return - risk_free_rate) / ann_vol if ann_vol > 0 else 0
+        ann_vol = period_ret.std() * np.sqrt(ann_factor)
+        # Conventional Sharpe: mean periodic excess return x periods per year / annualised volatility, on the
+        # same periods as the volatility (month-ends for windows >= 90 days). The CAGR used to be the
+        # numerator: it falls as volatility rises (variance drag), so volatile series were penalised twice.
+        sharpe = (period_ret.mean() * ann_factor - risk_free_rate) / ann_vol if ann_vol > 0 else 0
         return {
             "final_nav": f"{nav.iloc[-1]:,.2f}",
             "total_ret": f"{total_return:.2%}",

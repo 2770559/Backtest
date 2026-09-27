@@ -8,7 +8,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from pathlib import Path
+
 from backtest_core import (
+    align_price_data, prepare_portfolio,
     STRAT_BH, STRAT_ANNUAL, STRAT_RD_FULL, STRAT_ASYM, STRAT_RD_MIXED,
     clean_ticker, parse_portfolio, calculate_metrics,
     run_detailed_backtest, compute_annual_returns,
@@ -68,6 +71,19 @@ class TestParsePortfolio(unittest.TestCase):
         _, _, errs, _ = parse_portfolio({"tickers": "SPY, spy", "weights": "0.5, 0.5"})
         self.assertTrue(any("duplicate tickers" in e for e in errs))
 
+    def test_negative_weight_rejected(self):
+        # Sums to 1.0, so the sum check alone let a short position through.
+        _, _, errs, _ = parse_portfolio({"tickers": "QQQM, SPY", "weights": "-0.2, 1.2"})
+        self.assertIn("negative weight(s): QQQM", errs)
+        _, _, errs, _ = parse_portfolio({"tickers": "(A, B), SPY", "weights": "-0.1, 1.1"})
+        self.assertIn("negative weight(s): A+B", errs)
+
+    def test_non_finite_weight_rejected(self):
+        # float("nan") parses, and a NaN sum passed the |sum - 1| check.
+        for w in ("nan, 1.0", "inf, 0"):
+            _, _, errs, _ = parse_portfolio({"tickers": "QQQM, SPY", "weights": w})
+            self.assertIn("invalid weight format", errs, w)
+
 
 class TestCalculateMetrics(unittest.TestCase):
     def test_empty(self):
@@ -88,6 +104,40 @@ class TestCalculateMetrics(unittest.TestCase):
         nav = pd.Series([100, 120, 90, 130], index=idx)
         m = calculate_metrics(nav, 0)
         self.assertAlmostEqual(m["_max_dd"], (90 - 120) / 120, places=6)
+
+    @staticmethod
+    def _alternating_nav(mean_ann, vol_ann, periods_per_year, n, freq, start):
+        """NAV whose periodic returns alternate mean ± vol: an exact mean and volatility."""
+        m, s = mean_ann / periods_per_year, vol_ann / np.sqrt(periods_per_year)
+        r = np.tile([m + s, m - s], n // 2)
+        idx = pd.date_range(start, periods=n + 1, freq=freq)
+        return pd.Series(10000 * np.concatenate([[1.0], np.cumprod(1 + r)]), index=idx)
+
+    def test_sharpe_is_mean_excess_return_over_volatility(self):
+        """Conventional Sharpe = (mean periodic return x periods/yr - rf) / annualised vol.
+        The CAGR numerator it replaced fell with volatility: at 40% vol a 10%/yr mean
+        scored 0.00 instead of ~0.20."""
+        for vol in (0.10, 0.40):
+            nav = self._alternating_nav(0.10, vol, 12, 240, "ME", "2005-12-31")
+            m = calculate_metrics(nav, 0, risk_free_rate=0.02)
+            r = nav.pct_change().dropna()
+            expect = (r.mean() * 12 - 0.02) / (r.std() * np.sqrt(12))
+            self.assertAlmostEqual(m["_sharpe"], expect, places=12, msg=vol)
+            self.assertAlmostEqual(m["_sharpe"], 0.08 / vol, places=2, msg=vol)
+            self.assertEqual(m["sharpe"], f"{expect:.2f}")
+        cagr_based = (m["_ann_ret"] - 0.02) / (r.std() * np.sqrt(12))
+        self.assertLess(cagr_based, 0.05)          # what the old formula reported at 40% vol
+
+    def test_sharpe_uses_the_periodicity_of_the_volatility(self):
+        nav = self._alternating_nav(0.12, 0.20, 252, 200, "B", "2020-01-01")   # daily bars (< 90-day path)
+        m = calculate_metrics(nav, 0, risk_free_rate=0.02)
+        r = nav.pct_change().dropna()
+        self.assertAlmostEqual(m["_sharpe"], (r.mean() * 252 - 0.02) / (r.std() * np.sqrt(252)), places=12)
+
+    def test_sharpe_zero_without_volatility(self):
+        idx = pd.date_range("2020-01-31", periods=13, freq="ME")
+        m = calculate_metrics(pd.Series(100.0, index=idx), 0)
+        self.assertEqual(m["_sharpe"], 0)
 
 
 def _make_price_df(prices_a, prices_b, freq="ME", start="2020-01-31"):
@@ -269,6 +319,82 @@ class TestAppSmoke(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertGreater(len(at.error), 0)
 
+
+# --------------------------------------------------------------------------- #
+# Alignment and per-portfolio preparation (moved from the app in v2.6.0)
+# --------------------------------------------------------------------------- #
+def _prices(start="2020-01-01", n=400, late=None):
+    idx = pd.date_range(start, periods=n, freq="D")                # calendar days (crypto-like)
+    df = pd.DataFrame({"SPY": np.linspace(100, 150, n), "A": np.linspace(50, 80, n), "B": np.linspace(20, 10, n),
+                       "C": np.linspace(10, 30, n)}, index=idx)
+    df.loc[df.index.dayofweek >= 5, "SPY"] = np.nan              # benchmark trades on weekdays only
+    if late:
+        df.loc[df.index < pd.Timestamp(late), "C"] = np.nan
+    return df
+
+
+class AlignPrepareTest(unittest.TestCase):
+    def test_align_late_listing_moves_start(self):
+        out = align_price_data(_prices(late="2020-03-02"), "SPY", "2020-01-01", ["A", "B", "C"])
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["actual_start_day"], pd.Timestamp("2020-03-02"))
+        self.assertEqual(out["notice"][0], "warning")
+        self.assertIn("**C** listed late", out["notice"][1])
+        self.assertEqual(out["price_df"].index[0], pd.Timestamp("2020-03-02"))
+
+    def test_align_weekend_start_and_errors(self):
+        out = align_price_data(_prices(), "SPY", "2020-01-04", ["A"])       # Saturday
+        self.assertEqual(out["notice"], ("info", "Aligned to next trading day: 2020-01-06"))
+        out = align_price_data(_prices(), "SPY", "2030-01-01", ["A"])
+        self.assertIn("has no prices on or after", out["error"])
+
+    def test_prepare_composite_with_a_dataless_member(self):
+        df = _prices()
+        df["D"] = np.nan
+        price_df = align_price_data(df, "SPY", "2020-01-01", ["A", "B", "C", "D"])["price_df"]
+        p = {"name": "P", "tickers": "A, (B, D), C", "weights": "0.5, 0.3, 0.2", "thr": 60, "thr_up": 100,
+             "slot_bands": {"B+D": {"down": 40, "up": 40}}}
+        tks, wts, errs, comp = parse_portfolio(p)
+        out = prepare_portfolio(p, tks, wts, comp, price_df)
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["valid_tks"], ["A", "B", "C"])
+        self.assertAlmostEqual(out["w_series"]["B"], 0.3)           # the slot's 30% goes to the survivor
+        self.assertIsNone(out["groups"])                            # one survivor -> singleton
+        self.assertTrue(any("dropped from their composite" in m for _, m in out["notices"]))
+        self.assertEqual(out["label_to_id"]["B+D"], "B")
+        self.assertEqual(out["thr_dn"], {"*": 0.6, "B": 0.4})
+
+    def test_prepare_dropped_slot_renormalises(self):
+        df = _prices()
+        df["D"] = np.nan
+        price_df = align_price_data(df, "SPY", "2020-01-01", ["A", "D"])["price_df"]
+        p = {"name": "P", "tickers": "A, D", "weights": "0.6, 0.4", "thr": 40}
+        tks, wts, errs, comp = parse_portfolio(p)
+        out = prepare_portfolio(p, tks, wts, comp, price_df)
+        self.assertAlmostEqual(out["w_series"]["A"], 1.0)
+        self.assertTrue(any("remaining weights renormalized" in m for _, m in out["notices"]))
+        p2 = {"name": "Q", "tickers": "D", "weights": "1.0", "thr": 40}
+        tks, wts, errs, comp = parse_portfolio(p2)
+        self.assertIn("no usable data", prepare_portfolio(p2, tks, wts, comp, price_df)["error"])
+
+    def test_prepare_scales_weights_to_100(self):
+        price_df = align_price_data(_prices(), "SPY", "2020-01-01", ["A", "B", "C"])["price_df"]
+        p = {"name": "P", "tickers": "A, B, C", "weights": "0.335, 0.335, 0.335", "thr": 40}   # 100.5%: accepted
+        tks, wts, errs, comp = parse_portfolio(p)
+        self.assertEqual(errs, [])
+        out = prepare_portfolio(p, tks, wts, comp, price_df)
+        self.assertAlmostEqual(out["w_series"].sum(), 1.0, places=12)   # a rebalance keeps the portfolio's value
+        self.assertTrue(any("scaled to 100%" in m for _, m in out["notices"]))
+        p = {"name": "P", "tickers": "A, B, C", "weights": "0.4, 0.3, 0.3", "thr": 40}
+        tks, wts, errs, comp = parse_portfolio(p)
+        out = prepare_portfolio(p, tks, wts, comp, price_df)
+        self.assertEqual(list(out["w_series"]), [0.4, 0.3, 0.3])        # exactly 100%: untouched (legacy engine)
+        self.assertFalse(any("scaled to 100%" in m for _, m in out["notices"]))
+
+    def test_app_reloads_a_stale_engine(self):
+        import backtest_core
+        app = (Path(__file__).resolve().parent.parent / "backtest_app.py").read_text(encoding="utf-8")
+        self.assertIn(f'EXPECTED_CORE = "{backtest_core.CORE_VERSION}"', app)   # bump both with an engine change
 
 if __name__ == "__main__":
     unittest.main()

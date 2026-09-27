@@ -136,18 +136,23 @@ def _day_no(dates):
 _BASE_DAY = float((PREDICTION_BASELINE - WAR_START).days)
 
 
-def path_values(sk, dates, series, offsets=None):
+def path_values(sk, dates, series, offsets=None, hold=False):
     """Scenario `sk` evaluated at `dates` for each of `series`: linear between its
     nodes, NaN outside its span. `offsets` ({series: pp}, the calibrated basis) is
     phased in over the pre-baseline stretch and applied in full from the baseline
-    on, so a calibrated path runs 0 (2/28) -> 3/20 actual -> the original moves."""
+    on, so a calibrated path runs 0 (2/28) -> 3/20 actual -> the original moves.
+    `hold`: past the scenario's last node keep its final value instead of NaN —
+    for weighting and scoring (S1/S2 end at 12 months: from 2027-03 their NaN
+    blanked the weighted forecast and shortened their tracking-error window);
+    the charts leave it off and stop at the horizon."""
     nodes = SCENARIOS[sk]
     xs = _day_no([month_to_ts(n["month"]) for n in nodes])
     xd = _day_no(dates)
     ramp = np.clip(xd / _BASE_DAY, 0.0, 1.0)
     out = {}
     for s in series:
-        v = np.interp(xd, xs, [n[s] for n in nodes], left=np.nan, right=np.nan)
+        ys = [n[s] for n in nodes]
+        v = np.interp(xd, xs, ys, left=np.nan, right=ys[-1] if hold else np.nan)
         if offsets and s in offsets:
             v = v + offsets[s] * ramp
         out[s] = v
@@ -181,7 +186,8 @@ def _rmse(err):
 def scorecard(actual, offsets):
     """Portfolio forecast vs actual on the latest actual day, per scenario and
     probability-weighted. Tracking error = RMSE of (actual - forecast) over every
-    trading day after the baseline. None when nothing was traded after 3/20."""
+    trading day after the baseline — the same days for every scenario: past its
+    horizon a scenario holds its final value. None when nothing was traded after 3/20."""
     if actual is None or PORT not in actual.columns:
         return None
     days = actual.index[actual.index > PREDICTION_BASELINE]
@@ -191,7 +197,7 @@ def scorecard(actual, offsets):
     rows = []
     weighted = pd.Series(0.0, index=days)
     for sk, meta in SCENARIO_META.items():
-        pred = path_values(sk, days, [PORT], offsets)[PORT]
+        pred = path_values(sk, days, [PORT], offsets, hold=True)[PORT]
         weighted = weighted + meta["prob"] * pred
         rows.append({"key": sk, "name": meta["name"], "prob": meta["prob"],
                      "pred": float(pred.iloc[-1]), "rmse": _rmse(act - pred)})
@@ -201,10 +207,11 @@ def scorecard(actual, offsets):
 
 
 def weighted_forecast(day, series, offsets):
-    """Probability-weighted forecast of every series on `day`."""
+    """Probability-weighted forecast of every series on `day` (a scenario past its
+    horizon counts with its final value)."""
     total = {s: 0.0 for s in series}
     for sk, meta in SCENARIO_META.items():
-        vals = path_values(sk, [day], series, offsets).iloc[0]
+        vals = path_values(sk, [day], series, offsets, hold=True).iloc[0]
         for s in series:
             total[s] += meta["prob"] * vals[s]
     return total
@@ -231,16 +238,25 @@ TICKERS = list(ASSETS)
 FETCH_START = (WAR_START - pd.Timedelta(days=10)).strftime("%Y-%m-%d")  # covers the 2/27 base close
 ACTUAL_TTL = 3600         # a complete download is reused for an hour
 ACTUAL_RETRY_TTL = 120    # an incomplete one is retried after two minutes
+REFRESH_COOLDOWN = 300    # seconds between two forced refreshes, for the whole process (all visitors)
 RETRY_PAUSE = 1.0         # seconds before the one immediate retry of a non-rate-limited failure
 _RATE_LIMIT_MARKERS = ("rate limit", "too many requests")
 
 
 @st.cache_resource(show_spinner=False)
 def _actual_store():
-    """Process-wide singleton: {"lock", "entry": {expires, closes, failures, stale}}.
-    The lock also serializes yf.download, whose per-ticker errors land in
-    module-global state (yf.shared._ERRORS)."""
-    return {"lock": threading.Lock(), "entry": None}
+    """Process-wide singleton: {"lock", "entry": {expires, closes, failures, stale},
+    "forced_at": time of the last forced refresh}. The lock also serializes
+    yf.download, whose per-ticker errors land in module-global state
+    (yf.shared._ERRORS)."""
+    return {"lock": threading.Lock(), "entry": None, "forced_at": None}
+
+
+def refresh_wait(now=None):
+    """Seconds until the refresh button may force the next download (0 = now)."""
+    now = time.time() if now is None else now
+    last = _actual_store().get("forced_at")
+    return 0.0 if last is None else max(0.0, REFRESH_COOLDOWN - (now - last))
 
 
 def _tidy_reason(reason):
@@ -288,12 +304,19 @@ def load_actual(force=False, now=None, download=None):
     A complete download is served for ACTUAL_TTL; an incomplete one only for
     ACTUAL_RETRY_TTL, so a transient Yahoo failure heals itself instead of hiding
     the actual line for an hour. A ticker that fails keeps its last good series
-    (listed in `stale`). `download`/`now` are injection points for tests."""
+    (listed in `stale`). `force` (the refresh button) re-downloads at most once
+    per REFRESH_COOLDOWN for the whole process: any visitor can press it, and a
+    Yahoo rate limit would then hit everyone. `download`/`now` are injection
+    points for tests."""
     download = download or yf.download
     now = time.time() if now is None else now
     store = _actual_store()
     with store["lock"]:
         e = store["entry"]
+        if force and refresh_wait(now) > 0:
+            force = False
+        if force:
+            store["forced_at"] = now
         if force or e is None or e["expires"] <= now:
             try:
                 good, bad = _download_closes(TICKERS, download)
@@ -567,7 +590,9 @@ section.main > div { max-width: 1400px; margin: 0 auto; }
         else:
             st.warning("⚠️ 未能获取实际市场数据，图表仅显示预测数据")
     with col_refresh:
-        st.button("🔄 刷新数据", on_click=_request_refresh)
+        st.button("🔄 刷新数据", on_click=_request_refresh, disabled=refresh_wait() > 0,
+                  help=f"强制重新下载行情：每 {REFRESH_COOLDOWN // 60} 分钟最多一次（所有访客共用）；"
+                       "数据本身每小时自动更新")
     if actual is not None and missing:
         why = "；".join(f"{a}: {failures[a]}" for a in missing if a in failures)
         st.warning("实际数据缺少资产: " + ", ".join(missing) + "（组合线已按剩余权重归一化）"

@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 import altair as alt
 import requests
+import html
+import io
+import os
 import re
 import threading
 import time
@@ -24,14 +27,19 @@ try:
 except ImportError:            # optional dependency: browser-persisted default disabled
     HAS_JS_EVAL = False
 
+EXPECTED_CORE = "2026-09-26b"         # = backtest_core.CORE_VERSION
+
+
 def _fresh_core():
     """Streamlit Cloud hot-reloads this script on a push but can keep the old
     backtest_core in sys.modules until the app is rebooted: the import below
-    then fails on names added in this version (seen after the v2.5.0 push).
-    Reload the module when those names are missing (v2.6.0)."""
+    then fails on names added in this version (seen after the v2.5.0 push), or,
+    worse, a changed engine keeps running the old code. Reload the module when
+    its version stamp differs or those names are missing."""
     import importlib
     import backtest_core
-    if not all(hasattr(backtest_core, n) for n in ("align_price_data", "prepare_portfolio", "band_trigger_weights")):
+    if getattr(backtest_core, "CORE_VERSION", None) != EXPECTED_CORE or \
+            not all(hasattr(backtest_core, n) for n in ("align_price_data", "prepare_portfolio", "band_trigger_weights")):
         importlib.reload(backtest_core)
 
 
@@ -53,8 +61,8 @@ from backtest_core import (
 BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
 
 # --- Version ---
-APP_VERSION = "2.6.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-09-24"
+APP_VERSION = "2.8.0"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-26"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -324,21 +332,13 @@ section[data-testid="stSidebar"] h3 {
 </style>
 """, unsafe_allow_html=True)
 
-# --- Mode (v2.6.0): Backtest | Live Portfolio ---
-# Always rendered first in the sidebar in both modes, so it never shifts the
-# blocks below it (see the v2.5.1 note on transient elements).
-APP_MODE = st.sidebar.radio("Mode", ["Backtest", "Live Portfolio"], horizontal=True, key="app_mode",
-                            label_visibility="collapsed")
-_HDR = ({"Backtest": ("Portfolio Backtest & Rebalance Analyzer", "Multi-portfolio backtesting with rebalancing strategies"),
-         "Live Portfolio": ("Live Portfolio Desk", "Share-level orders that keep the real account on the live rule's backtest")}
-        [APP_MODE])
-
 # --- Header ---
+# (v2.8.0: the Live Portfolio mode of v2.6.0 was removed; this app is the backtester only.)
 st.markdown(f"""
 <div class="header-bar">
     <div>
-        <h2>{_HDR[0]}</h2>
-        <div class="subtitle">{_HDR[1]}</div>
+        <h2>Portfolio Backtest & Rebalance Analyzer</h2>
+        <div class="subtitle">Multi-portfolio backtesting with rebalancing strategies</div>
     </div>
     <div class="version-badge">v{APP_VERSION} · {APP_BUILD_DATE}</div>
 </div>
@@ -368,8 +368,17 @@ if 'init_funds' not in st.session_state: st.session_state['init_funds'] = 10000
 # --- Config persistence (sidebar Config I/O + Save Default button) ---
 SAVED_CONFIG_DIR = Path(__file__).parent / "Backtest"
 DEFAULT_CONFIG_PATH = SAVED_CONFIG_DIR / "_default.json"
+# A default saved in a file is shared by every visitor of a hosted app (one file on the server): only the local
+# checkout uses it. On Streamlit Cloud (the repo is cloned under /mount/src) the browser copy is the default.
+ON_SHARED_HOST = str(Path(__file__).resolve()).startswith("/mount/src/") or bool(os.environ.get("BACKTEST_SHARED_HOST"))
+FILE_DEFAULT = not ON_SHARED_HOST
 VALID_STRATS = {STRAT_BH, STRAT_ANNUAL, STRAT_SEMI, STRAT_RD_LOCAL, STRAT_RD_MIXED, STRAT_RD_FULL,
                 STRAT_ASYM}
+# What the sidebar widgets accept (a loaded value outside it raised on every rerun of the session):
+# Start Date runs START_DATE_MIN .. today; Initial Investment MIN_FUNDS .. MAX_FUNDS (the widget itself has
+# no maximum, but a browser number above 2**53 - 1 is rejected, so a config value is capped well below it).
+START_DATE_MIN = datetime(1970, 1, 1).date()
+MIN_FUNDS, MAX_FUNDS = 100, 10 ** 12
 
 def _norm_band_pct(v, fallback):
     """Band in percent as an int inside the UI's 1..200 range; None / non-numeric -> fallback."""
@@ -387,6 +396,132 @@ def _norm_band_mode(v):
     anything else or missing -> "rel", the original rule, so pre-2.5.2 configs
     run unchanged."""
     return BAND_MODE_RATIO if str(v or "").strip().lower() == BAND_MODE_RATIO else BAND_MODE_REL
+
+
+def _md_text(s):
+    """Outside text (Yahoo's error reasons, config values, file errors) for a markdown element: "$" is
+    escaped, or a "$…$" pair is typeset as LaTeX ("$QQQM: possibly delisted" twice garbled the warning)."""
+    return str(s).replace("$", "\\$")
+
+
+def _vl_field(name):
+    """A column name as a Vega-Lite field reference: "." and "[ ]" mean nested access there, so the tooltip
+    row of "Benchmark(510300.SS)" resolved to nothing (and an unmatched "]" breaks the chart). Escaped with
+    "\\"; the tooltip title keeps the plain name."""
+    return re.sub(r"([\\.\[\]])", r"\\\1", str(name))
+
+
+def _stated_but_changed(raw, kept):
+    """True when a value the config states was not kept as stated ("40" -> 40 is no change)."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return False
+    try:
+        return float(raw) != float(kept)
+    except (TypeError, ValueError):
+        return True
+
+
+def _negative_weights(weights_str):
+    """Weight tokens below zero (unparseable ones are left to the allocation matrix's warning)."""
+    neg = []
+    for w in str(weights_str or "").replace("，", ",").split(","):
+        try:
+            if float(w) < 0:
+                neg.append(w.strip())
+        except ValueError:
+            pass
+    return neg
+
+
+def _parse_config(loaded_config):
+    """Validate and normalise a config dict WITHOUT touching session state -> (values, warnings).
+
+    Values the widgets would reject — a start date outside the picker's range, funds outside the input's,
+    a band outside 1..200 — are brought into range and reported: such a value used to raise on every rerun
+    of the session. Duplicate portfolio ids (a portfolio copy-pasted inside the JSON) get fresh ones: they
+    collided as widget keys. Raises ValueError when the file is not a config at all, before anything is
+    applied."""
+    if not isinstance(loaded_config, dict):
+        raise ValueError("not a backtest config (expected a JSON object)")
+    raw_ports = loaded_config.get("portfolios") or []
+    if not isinstance(raw_ports, list):
+        raise ValueError('"portfolios" must be a list')
+    warns, ports, ids = [], [], set()
+    for n, raw in enumerate(raw_ports, 1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"portfolio {n} is not an object")
+        p = dict(raw)
+        pid = str(p.get('id') or '').strip()
+        p['id'] = pid if pid and pid not in ids else str(uuid.uuid4())
+        ids.add(p['id'])
+        for key, blank in (('name', 'Port ?'), ('tickers', ''), ('weights', '')):
+            p[key] = blank if p.get(key) is None else str(p[key])
+        name = _md_text(p['name'])
+        p['thr'] = _norm_band_pct(p.get('thr'), 38)
+        p['thr_up'] = _norm_band_pct(p.get('thr_up'), p['thr'])
+        for key, side in (('thr', "Down"), ('thr_up', "Up")):
+            if _stated_but_changed(raw.get(key), p[key]):
+                warns.append(f"**{name}**: {side} band {_md_text(repr(raw.get(key)))} set to {p[key]}% "
+                             "(bands run 1–200%).")
+        p['slot_bands'] = normalize_slot_bands(p.get('slot_bands'))
+        for label, band in p['slot_bands'].items():
+            for side in ("down", "up"):
+                v = band[side]
+                if v is not None and not 1 <= v <= 200:
+                    band[side] = min(200, max(1, v))
+                    warns.append(f"**{name}**: per-slot {side} band of **{_md_text(label)}** {v}% set to "
+                                 f"{band[side]}% (bands run 1–200%, like the editor's).")
+        p['band_mode'] = _norm_band_mode(p.get('band_mode'))
+        if str(raw.get('band_mode') or '').strip().lower() not in ('',) + BAND_MODES:
+            warns.append(f"**{name}**: unknown band mode {_md_text(repr(raw.get('band_mode')))} — "
+                         f"{BAND_MODE_LABELS[BAND_MODE_REL]} used.")
+        known = set(slot_labels(p['tickers']))
+        unknown = [k for k in p['slot_bands'] if k not in known]
+        if unknown:
+            warns.append(
+                f"**{name}**: per-slot band(s) for unknown slot(s) **{_md_text(', '.join(unknown))}** "
+                "— kept in the config but ignored until a matching slot exists (labels: the "
+                "ticker, or a composite's members joined with '+'). Blank them in "
+                "*Per-slot bands* to drop them.")
+        strat = p.get('strat')
+        strat = STRAT_LEGACY_MAP.get(strat, strat) if isinstance(strat, str) else strat
+        if strat not in VALID_STRATS:
+            if strat is not None:
+                warns.append(f"**{name}**: unknown strategy {_md_text(repr(strat))} — {STRAT_ASYM} used.")
+            strat = STRAT_ASYM
+        p['strat'] = strat
+        neg = _negative_weights(p['weights'])
+        if neg:
+            warns.append(f"**{name}**: negative weight(s) {_md_text(', '.join(neg))} — set them to 0 or "
+                         "more; Analyze refuses them.")
+        ports.append(p)
+
+    bench = loaded_config.get("benchmark")
+    bench = str(bench).strip() if bench is not None and str(bench).strip() else "SPY"
+
+    raw_sd, today = loaded_config.get("start_date", "2020-01-01"), datetime.today().date()
+    try:
+        sd = pd.Timestamp(str(raw_sd)).date()
+    except (TypeError, ValueError):
+        warns.append(f"Start date {_md_text(repr(raw_sd))} is not a date — 2020-01-01 used.")
+        sd = datetime(2020, 1, 1).date()
+    if not START_DATE_MIN <= sd <= today:
+        kept = min(today, max(START_DATE_MIN, sd))
+        warns.append(f"Start date {sd} is outside {START_DATE_MIN} … today — {kept} used.")
+        sd = kept
+
+    raw_f = loaded_config.get("initial_funds", 10000)
+    try:
+        funds = int(float(raw_f))
+    except (TypeError, ValueError, OverflowError):
+        warns.append(f"Initial investment {_md_text(repr(raw_f))} is not a number — \\$10,000 used.")
+        funds = 10000
+    if not MIN_FUNDS <= funds <= MAX_FUNDS:
+        kept = min(MAX_FUNDS, max(MIN_FUNDS, funds))
+        warns.append(f"Initial investment \\${funds:,} is outside \\${MIN_FUNDS:,} … \\${MAX_FUNDS:,} — "
+                     f"\\${kept:,} used.")
+        funds = kept
+    return {"portfolios": ports, "bi": bench, "sd": sd, "init_funds": funds}, warns
 
 
 # Rebalance-row colours in the detail table (v2.5.4): (Pre-Rebal, Post-Rebal).
@@ -429,35 +564,20 @@ def _apply_config_state(loaded_config):
     band (missing/null -> equal to thr, i.e. symmetric), `slot_bands` = per-slot
     overrides {slot_label: {"down": pct|None, "up": pct|None}}. v2.5.2 adds
     `band_mode` ("rel" | "ratio", missing -> "rel"). Old configs therefore load
-    unchanged and run on the engine's legacy scalar path."""
-    st.session_state.portfolios_list = loaded_config.get("portfolios", [])
-    band_warns = []
-    for p in st.session_state.portfolios_list:
-        if 'id' not in p: p['id'] = str(uuid.uuid4())
-        p.setdefault('name', 'Port ?')
-        p.setdefault('tickers', '')
-        p.setdefault('weights', '')
-        p['thr'] = _norm_band_pct(p.get('thr'), 38)
-        p['thr_up'] = _norm_band_pct(p.get('thr_up'), p['thr'])
-        p['slot_bands'] = normalize_slot_bands(p.get('slot_bands'))
-        p['band_mode'] = _norm_band_mode(p.get('band_mode'))
-        known = set(slot_labels(p['tickers']))
-        unknown = [k for k in p['slot_bands'] if k not in known]
-        if unknown:
-            band_warns.append(
-                f"**{p['name']}**: per-slot band(s) for unknown slot(s) **{', '.join(unknown)}** "
-                "— kept in the config but ignored until a matching slot exists (labels: the "
-                "ticker, or a composite's members joined with '+'). Blank them in "
-                "*Per-slot bands* to drop them.")
-        if p.get('strat') in STRAT_LEGACY_MAP:
-            p['strat'] = STRAT_LEGACY_MAP[p['strat']]
-        if p.get('strat') not in VALID_STRATS:
-            p['strat'] = STRAT_ASYM
-    if band_warns:
-        st.session_state['_flash_warn'] = band_warns
-    st.session_state['bi'] = loaded_config.get("benchmark", "SPY")
-    st.session_state['sd'] = pd.to_datetime(loaded_config.get("start_date", "2020-01-01")).date()
-    st.session_state['init_funds'] = int(loaded_config.get("initial_funds", 10000))
+    unchanged and run on the engine's legacy scalar path.
+
+    The whole config is parsed and validated first (_parse_config raises before
+    anything is applied); session state and the editor clean-up below are then
+    written in one step. A value that failed halfway through used to leave the
+    portfolios replaced, the clean-up skipped and stale editor edits flushed
+    into the freshly loaded portfolios."""
+    cfg, warns = _parse_config(loaded_config)
+    st.session_state.portfolios_list = cfg["portfolios"]
+    if warns:
+        st.session_state['_flash_warn'] = warns
+    st.session_state['bi'] = cfg["bi"]
+    st.session_state['sd'] = cfg["sd"]
+    st.session_state['init_funds'] = cfg["init_funds"]
     st.session_state.run_backtest = False
     # Discard allocation-editor scaffolding: stale in-flight edits must not be
     # flushed over a freshly loaded config on the next matrix rebuild.
@@ -479,13 +599,16 @@ if 'portfolios_list' not in st.session_state:
     # New session: a saved default (Save Default button) replaces the built-in
     # config below. Delete Backtest/_default.json to restore the built-ins.
     _default_cfg = None
-    if DEFAULT_CONFIG_PATH.is_file():
+    if FILE_DEFAULT and DEFAULT_CONFIG_PATH.is_file():
         try:
             _default_cfg = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             _default_cfg = None
-    if _default_cfg and _default_cfg.get("portfolios"):
-        _apply_config_state(_default_cfg)
+    if isinstance(_default_cfg, dict) and _default_cfg.get("portfolios"):
+        try:
+            _apply_config_state(_default_cfg)
+        except Exception as e:      # not a usable config (nothing applied): the built-ins below take over
+            st.session_state['_flash_warn'] = [f"Saved default ignored: {_md_text(e)}"]
 
 if 'portfolios_list' not in st.session_state:
     st.session_state.portfolios_list = [
@@ -528,7 +651,7 @@ LS_DEFAULT_KEY = "backtest_default_config"
 
 LS_GET_EXPR = f"localStorage.getItem({json.dumps(LS_DEFAULT_KEY)}) ?? '__none__'"
 
-if DEFAULT_CONFIG_PATH.is_file():
+if FILE_DEFAULT and DEFAULT_CONFIG_PATH.is_file():
     st.session_state['_ls_checked'] = True     # file default already applied
     st.session_state['_ls_default_present'] = True
 if HAS_JS_EVAL and not st.session_state.get('_ls_checked'):
@@ -555,9 +678,12 @@ if HAS_JS_EVAL and not st.session_state.get('_ls_checked'):
             except Exception:
                 pass
 
-def delete_portfolio(idx):
-    if 0 <= idx < len(st.session_state.portfolios_list):
-        st.session_state.portfolios_list.pop(idx)
+def delete_portfolio(pid):
+    """Remove the portfolio with this id. By id, not row index: a second click
+    handled before the rerun re-rendered the rows removed whichever portfolio
+    had moved into the clicked row's position."""
+    st.session_state.portfolios_list[:] = [p for p in st.session_state.portfolios_list
+                                           if p.get('id') != pid]
 
 def _n_to_letters(n):
     """1 -> A ... 26 -> Z, 27 -> AA (spreadsheet-column order)."""
@@ -720,7 +846,11 @@ def fetch_price_history(tickers, start, download=None, now=None):
                 entries[tk] = {"expires": now + PRICE_CACHE_MISS_TTL, "start": start_ts,
                                "series": None, "reason": why}
             if len(entries) > PRICE_CACHE_MAX:
-                oldest = sorted(entries, key=lambda k: entries[k]["expires"])
+                # Earliest expiry first, so expired entries go before live ones; never a ticker of
+                # this request: its entry is read right below (evicting it raised KeyError once the
+                # process-wide cache was full).
+                wanted = set(tickers)
+                oldest = sorted((k for k in entries if k not in wanted), key=lambda k: entries[k]["expires"])
                 for tk in oldest[:len(entries) - PRICE_CACHE_MAX]:
                     del entries[tk]
         frames, failures = [], {}
@@ -741,6 +871,9 @@ def fetch_price_history(tickers, start, download=None, now=None):
 # Series names that collide with chart/table plumbing (index/melt names) or
 # the allocation matrix's token column ("Asset").
 RESERVED_SERIES_NAMES = {"Date", "Return", "Drawdown", "Portfolio", "Asset"}
+# Distinct tickers (benchmark included) one Analyze may download: the public app's
+# downloads share one lock, so a huge request made every other visitor wait.
+MAX_TICKERS_PER_RUN = 60
 
 def validate_inputs(portfolios, benchmark):
     """Validate benchmark + all portfolio configs. Returns list of error messages."""
@@ -761,9 +894,14 @@ def validate_inputs(portfolios, benchmark):
     bench_label = f"Benchmark({benchmark})"
     if bench_label in names:
         errors.append(f'Portfolio name "{bench_label}" collides with the benchmark series')
+    all_tks = {clean_ticker(benchmark)} if str(benchmark).strip() else set()
     for p in portfolios:
-        _, _, perrs, _ = parse_portfolio(p)
+        p_tks, _, perrs, _ = parse_portfolio(p)
+        all_tks.update(p_tks)
         errors.extend(f"**{p['name']}**: {e}" for e in perrs)
+    if len(all_tks) > MAX_TICKERS_PER_RUN:
+        errors.append(f"{len(all_tks)} distinct tickers (benchmark included) — one run downloads at most "
+                      f"{MAX_TICKERS_PER_RUN}. Remove some assets, or compare them in separate runs.")
     return errors
 
 # --- Allocation matrix (Portfolio-Visualizer style editor) ------------------
@@ -846,32 +984,35 @@ NAME_SEP = " - "
 # (e.g. Streamlit Cloud), DNS resolution can HANG — requests' timeout does not
 # cover getaddrinfo — wedging the script thread until the platform kills the
 # app. After 2 straight failures the endpoint is never tried again in this
-# process and labels come from CN_NAME_SEED only.
-_cn_name_failures = {"n": 0}
+# process and labels come from CN_NAME_SEED only. The counter lives in
+# st.cache_resource: a module-level dict is re-created by every rerun of this
+# script, so the breaker never tripped.
+CN_NAME_MAX_FAILURES = 2
+
+
+@st.cache_resource(show_spinner=False)
+def _cn_name_breaker():
+    """Process-wide {"n": consecutive failed lookups} (same dict on every rerun, for every session)."""
+    return {"n": 0}
+
+
+class CNNamesUnavailable(Exception):
+    """Tencent's endpoint gave no answer. Raised inside the cached lookup, so the
+    failure is not cached for a day (exceptions bypass st.cache_data)."""
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_cn_names(symbols):
-    """Batch-resolve .SS/.SZ tickers to Chinese short names via Tencent's
-    quote API (GBK payload, no auth). The HTTP call runs on a daemon thread
-    with a hard 4s deadline so even a hung DNS lookup can't block the script.
-    Failures fall back to CN_NAME_SEED; tickers absent from the result simply
-    display as the bare code."""
-    codes = {}
-    for tk in symbols:
-        tk = str(tk).strip().upper()
-        if tk.endswith(".SS") and tk[:-3].isdigit():
-            codes["sh" + tk[:-3]] = tk
-        elif tk.endswith(".SZ") and tk[:-3].isdigit():
-            codes["sz" + tk[:-3]] = tk
-    out = dict(CN_NAME_SEED)
-    if not codes or _cn_name_failures["n"] >= 2:
-        return out
+def _tencent_names(codes):
+    """codes: ((tencent code, ticker), ...) -> {ticker: Chinese short name}. The
+    HTTP call runs on a daemon thread with a hard 4s deadline so even a hung DNS
+    lookup can't block the script; no answer raises CNNamesUnavailable."""
+    code_map = dict(codes)
+    breaker = _cn_name_breaker()
     box = {}
 
     def _worker():
         try:
-            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(codes),
+            r = requests.get("https://qt.gtimg.cn/q=" + ",".join(code_map),
                              headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
             box["payload"] = r.content.decode("gbk", errors="replace")
         except Exception:
@@ -882,13 +1023,37 @@ def fetch_cn_names(symbols):
     t.join(4.0)
     payload = box.get("payload")
     if payload is None:
-        _cn_name_failures["n"] += 1
-        return out
-    _cn_name_failures["n"] = 0
+        breaker["n"] += 1
+        raise CNNamesUnavailable("Tencent quote endpoint did not answer")
+    breaker["n"] = 0
+    names = {}
     for m in re.finditer(r'v_(s[hz]\d+)="([^"]*)"', payload):
         parts = m.group(2).split("~")
-        if len(parts) > 2 and parts[1] and m.group(1) in codes:
-            out[codes[m.group(1)]] = parts[1]
+        if len(parts) > 2 and parts[1] and m.group(1) in code_map:
+            names[code_map[m.group(1)]] = parts[1]
+    return names
+
+
+def fetch_cn_names(symbols):
+    """Batch-resolve .SS/.SZ tickers to Chinese short names via Tencent's
+    quote API (GBK payload, no auth). Answers are cached for a day; failures
+    are not (the next rerun retries until the breaker trips) and fall back to
+    CN_NAME_SEED; tickers absent from the result simply display as the bare
+    code."""
+    codes = {}
+    for tk in symbols:
+        tk = str(tk).strip().upper()
+        if tk.endswith(".SS") and tk[:-3].isdigit():
+            codes["sh" + tk[:-3]] = tk
+        elif tk.endswith(".SZ") and tk[:-3].isdigit():
+            codes["sz" + tk[:-3]] = tk
+    out = dict(CN_NAME_SEED)
+    if not codes or _cn_name_breaker()["n"] >= CN_NAME_MAX_FAILURES:
+        return out
+    try:
+        out.update(_tencent_names(tuple(sorted(codes.items()))))
+    except CNNamesUnavailable:
+        pass
     return out
 
 
@@ -1131,12 +1296,17 @@ def yahoo_symbol_search(query):
     return out
 
 
+CPI_TIMEOUT = 10    # seconds per connect / read: pd.read_csv(url) had none, so a stalled FRED hung the run
+
+
 @st.cache_data(ttl=86400)
 def fetch_cpi_data():
     """Raises on failure so a transient FRED outage is NOT cached for 24h
     (exceptions bypass st.cache_data); the caller falls back to fixed-rate."""
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
-    cpi = pd.read_csv(url, parse_dates=['observation_date'], index_col='observation_date')
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=CPI_TIMEOUT)
+    r.raise_for_status()
+    cpi = pd.read_csv(io.StringIO(r.text), parse_dates=['observation_date'], index_col='observation_date')
     cpi.columns = ['CPI']
     return cpi
 
@@ -1158,7 +1328,7 @@ def render_summary_cards(metrics, color_map):
         final = f"Final ${m['final_nav']}" if m["final_nav"] not in ("-", "Err") else "—"
         cards.append(
             f'<div class="sum-card" style="--pc:{pc}">'
-            f'<div class="sum-head"><span class="dot"></span>{m["name"]}</div>'
+            f'<div class="sum-head"><span class="dot"></span>{html.escape(str(m["name"]))}</div>'
             f'<div class="sum-hero {pol}">{hero}{per}</div>'
             f'<div class="sum-minis">'
             f'<div><span class="k">Total</span><span class="v">{total}</span></div>'
@@ -1177,7 +1347,7 @@ def _series_th(name, color_map):
     """Table header cell with the series' identity dot."""
     c = color_map.get(name)
     dot = f'<span class="th-dot" style="background:{c}"></span>' if c else ""
-    return f"<th>{dot}{name}</th>"
+    return f"<th>{dot}{html.escape(str(name))}</th>"
 
 
 def render_comparison_table(metrics, color_map):
@@ -1194,6 +1364,8 @@ def render_comparison_table(metrics, color_map):
               ("Sharpe Ratio", "sharpe", "_sharpe", True),
               ("Rebalances", "rebal_cnt", None, None),
               ("Turnover /yr", "turnover", "_turnover", False)]
+    tips = {"sharpe": "(mean periodic return × periods per year − risk-free rate) ÷ annualised volatility; "
+                      "month-end returns for windows of 90 days or more"}
 
     header = "<tr><th>Metric</th>"
     for m in metrics:
@@ -1202,7 +1374,8 @@ def render_comparison_table(metrics, color_map):
 
     rows = ""
     for label, key, raw_key, higher_better in fields:
-        rows += f"<tr><td><strong>{label}</strong></td>"
+        tip = f' title="{html.escape(tips[key])}"' if key in tips else ""
+        rows += f"<tr><td><strong{tip}>{label}</strong></td>"
         raw_vals = []
         for m in metrics:
             if raw_key and isinstance(m.get(raw_key), (int, float)):
@@ -1291,9 +1464,14 @@ def _confirm_save_default():
         "New sessions will open with **" + ", ".join(p['name'] for p in ports) + "** · "
         f"benchmark `{st.session_state['bi']}` · start {st.session_state['sd']} · "
         f"${st.session_state['init_funds']:,}")
-    has_saved = DEFAULT_CONFIG_PATH.is_file() or st.session_state.get('_ls_default_present')
+    has_saved = (FILE_DEFAULT and DEFAULT_CONFIG_PATH.is_file()) or st.session_state.get('_ls_default_present')
     if has_saved:
         st.warning("A saved default already exists — Confirm will **replace** it.")
+    if ON_SHARED_HOST:
+        st.caption("Saved in this browser only: other visitors keep their own default.")
+        if not HAS_JS_EVAL:
+            st.info("This server cannot keep a default: browser storage is not available.")
+            return
     c1, c2 = st.columns(2)
     if c1.button("Confirm & Save", type="primary", width="stretch"):
         payload = json.dumps({
@@ -1302,11 +1480,12 @@ def _confirm_save_default():
             "initial_funds": st.session_state['init_funds'],
             "portfolios": st.session_state.portfolios_list,
         }, indent=2, ensure_ascii=False)
-        try:
-            SAVED_CONFIG_DIR.mkdir(exist_ok=True)
-            DEFAULT_CONFIG_PATH.write_text(payload, encoding="utf-8")
-        except Exception as e:      # cloud FS quirks: browser copy still proceeds
-            st.toast(f"File save failed: {e}", icon="⚠️")
+        if FILE_DEFAULT:
+            try:
+                SAVED_CONFIG_DIR.mkdir(exist_ok=True)
+                DEFAULT_CONFIG_PATH.write_text(payload, encoding="utf-8")
+            except Exception as e:      # file system quirks: the browser copy still proceeds
+                st.toast(f"File save failed: {e}", icon="⚠️")
         if HAS_JS_EVAL:
             st.session_state['_ls_payload'] = payload      # -> localStorage setItem
             st.session_state['_ls_nonce'] = str(uuid.uuid4())[:8]
@@ -1318,23 +1497,16 @@ def _confirm_save_default():
     if has_saved:
         st.divider()
         if st.button(":material/restart_alt: Reset default to built-ins", width="stretch",
-                     help="Delete the saved default (file + this browser's copy); new "
-                          "sessions open with the built-in config again."):
-            DEFAULT_CONFIG_PATH.unlink(missing_ok=True)
+                     help="Delete the saved default (this browser's copy, and the local file when running on "
+                          "your own machine); new sessions open with the built-in config again."):
+            if FILE_DEFAULT:
+                DEFAULT_CONFIG_PATH.unlink(missing_ok=True)
             if HAS_JS_EVAL:
                 st.session_state['_ls_payload'] = ""       # "" -> localStorage removeItem
                 st.session_state['_ls_nonce'] = str(uuid.uuid4())[:8]
             st.session_state['_ls_default_present'] = False
             st.session_state['_flash_toast'] = "Default reset — new sessions open with built-ins"
             st.rerun()
-
-# Live Portfolio mode: the desk replaces the whole Backtest UI. It reuses this
-# page's price cache (fetch_price_history) and saved configs; the Backtest
-# settings keep their values in session state while the other mode is shown.
-if APP_MODE == "Live Portfolio":
-    import live_page
-    live_page.render_live_desk(fetch_price_history, SAVED_CONFIG_DIR)
-    st.stop()
 
 with st.sidebar:
     st.markdown("### Settings")
@@ -1343,11 +1515,14 @@ with st.sidebar:
     start_d = st.date_input(
         "Start Date",
         value=st.session_state['sd'],
-        min_value=datetime(1970, 1, 1).date(),
+        min_value=START_DATE_MIN,
         max_value=datetime.today().date()
     )
-    init_f = st.number_input("Initial Investment ($)", min_value=100, value=st.session_state['init_funds'], step=1000)
-    rf_pct = st.number_input("Risk-free Rate (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25, format="%.2f")
+    init_f = st.number_input("Initial Investment ($)", min_value=MIN_FUNDS, value=st.session_state['init_funds'], step=1000)
+    rf_pct = st.number_input("Risk-free Rate (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25, format="%.2f",
+                             help="Used by the Sharpe ratio = (mean periodic return × periods per year − "
+                                  "risk-free rate) ÷ annualised volatility, on month-end returns for windows "
+                                  "of 90 days or more (daily below). Portfolios and benchmark alike.")
     rf_rate = rf_pct / 100.0
 
     st.session_state['bi'] = bench_in
@@ -1367,8 +1542,8 @@ with st.sidebar:
         if st.button(":material/folder_open: Load Saved Config", width="stretch"):
             try:
                 apply_config(json.loads(sel_saved.read_text(encoding="utf-8")))
-            except Exception as e:
-                st.error(f"Load error: {e}")
+            except Exception as e:      # nothing was applied (see _apply_config_state)
+                st.error(f"Load error: {_md_text(e)}")
 
     # Placeholder only: the sidebar renders BEFORE the main section's write-backs
     # (row edits, matrix sync). The actual download button is rendered into this
@@ -1382,7 +1557,7 @@ with st.sidebar:
             if st.button(":material/upload: Apply Config", width="stretch"):
                 apply_config(loaded_config)
         except Exception as e:
-            st.error(f"Parse error: {e}")
+            st.error(f"Parse error: {_md_text(e)}")
 
 # --- 4. Main Area: Portfolio Config ---
 strategy_options = [
@@ -1392,8 +1567,12 @@ strategy_options = [
 
 ROW_SPEC = [0.28, 1.9, 2.2, 0.8, 0.8, 1.25, 0.5]
 
+# Config-load warnings go into a container rendered on EVERY run: shown once
+# and gone on the next rerun, they would otherwise shift (and re-mount) every
+# element below them, dropping digits being typed at that moment.
+_flash_box = st.container()
 for _w in st.session_state.pop('_flash_warn', None) or []:
-    st.warning(_w)
+    _flash_box.warning(_w)
 
 st.markdown('<div class="sec-label">Portfolios</div>', unsafe_allow_html=True)
 with st.container(border=True):
@@ -1461,7 +1640,7 @@ with st.container(border=True):
         with cols[6]:
             if total_portfolios > 1:
                 st.button(":material/delete:", key=f"del_{port['id']}",
-                          on_click=delete_portfolio, args=(i,), help="Remove this portfolio")
+                          on_click=delete_portfolio, args=(port['id'],), help="Remove this portfolio")
 
     # --- Actions: add portfolio / persist current setup as startup default ---
     act_cols = st.columns([1.4, 2.2, 4.4])
@@ -1628,7 +1807,8 @@ with st.container(border=True):
             total = float(pd.to_numeric(edited_alloc[p['name']], errors='coerce').fillna(0).sum())
             ok = abs(total - 100) < 0.01
             color, mark = ('var(--good)', '✓') if ok else ('var(--bad)', '≠ 100%')
-            sums.append(f'<span style="color:{color};font-weight:600">{p["name"]}: {total:.4g}% {mark}</span>')
+            sums.append(f'<span style="color:{color};font-weight:600">{html.escape(str(p["name"]))}: '
+                        f'{total:.4g}% {mark}</span>')
         st.markdown('<div class="alloc-sums">' + ' &nbsp;·&nbsp; '.join(sums) + '</div>',
                     unsafe_allow_html=True)
 
@@ -1689,15 +1869,17 @@ if st.session_state.run_backtest:
             # Nothing was cached; show once and let the next Analyze retry
             # instead of re-hitting Yahoo on every widget rerun.
             st.session_state.run_backtest = False
-            st.error(f"Download error: {e}"); st.stop()
+            st.error(f"Download error: {_md_text(e)}"); st.stop()
         if bench_tk in fetch_failures:
             st.session_state.run_backtest = False
-            st.error(f"Benchmark **{bench_tk}** could not be downloaded: {fetch_failures[bench_tk]}. "
+            st.error(f"Benchmark **{_md_text(bench_tk)}** could not be downloaded: "
+                     f"{_md_text(fetch_failures[bench_tk])}. "
                      "Nothing was cached \u2014 wait a moment and click Analyze again.")
             st.stop()
         if fetch_failures:
+            # Reasons (and typed tickers) are Yahoo's / the user's text: "$" escaped (_md_text).
             st.warning("Yahoo returned no prices for "
-                       + "; ".join(f"**{tk}** ({why})" for tk, why in fetch_failures.items())
+                       + "; ".join(f"**{_md_text(tk)}** ({_md_text(why)})" for tk, why in fetch_failures.items())
                        + " \u2014 excluded from this run; click Analyze again to retry.")
 
         # Scrub data glitches: corrupted listing-day prints (wrong scale on day 1)
@@ -1937,7 +2119,7 @@ if st.session_state.run_backtest:
 
         tooltips = [alt.Tooltip('Date:T', format='%Y-%m-%d', title='Date')]
         for col in chart_df.columns:
-            tooltips.append(alt.Tooltip(field=col, type='quantitative', format='.2%', title=col))
+            tooltips.append(alt.Tooltip(field=_vl_field(col), type='quantitative', format='.2%', title=col))
 
         selectors = alt.Chart(rule_data).mark_rule(opacity=0.001, strokeWidth=40).encode(
             x='Date:T', tooltip=tooltips
@@ -1974,7 +2156,7 @@ if st.session_state.run_backtest:
             )
             dd_tooltips = [alt.Tooltip('Date:T', format='%Y-%m-%d', title='Date')]
             for col in dd_df.columns:
-                dd_tooltips.append(alt.Tooltip(field=col, type='quantitative', format='.2%', title=col))
+                dd_tooltips.append(alt.Tooltip(field=_vl_field(col), type='quantitative', format='.2%', title=col))
             dd_selectors = alt.Chart(dd_wide).mark_rule(opacity=0.001, strokeWidth=40).encode(
                 x='Date:T', tooltip=dd_tooltips
             ).add_params(dd_nearest)

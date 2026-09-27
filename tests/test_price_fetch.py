@@ -20,7 +20,10 @@ yfinance's exact layout (placeholder included) and fills yf.shared._ERRORS.
 StartDateNoticeTest (v2.4.2) reuses the same fake: exactly one notice about
 the effective start day, naming whatever finally decided it.
 """
+import json
+import socket
 import sys
+import threading
 import unittest
 from datetime import date
 from pathlib import Path
@@ -28,6 +31,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -234,6 +238,132 @@ class FetchPriceHistoryTest(unittest.TestCase):
         again, _ = app.fetch_price_history(("SPY",), START, download=fake, now=1)
         self.assertFalse(again["SPY"].isna().any())
 
+    def test_eviction_never_drops_a_ticker_of_the_request(self):
+        """Once the process-wide cache was full, evicting the earliest-expiring entry
+        could remove a still-live ticker of this very request, read right after:
+        KeyError, shown as "Download error: 'A'"."""
+        fake = FakeYahoo()
+        app.fetch_price_history(("A",), START, download=fake, now=-10)
+        app.fetch_price_history(tuple(f"T{i:03d}" for i in range(app.PRICE_CACHE_MAX - 1)), START,
+                                download=fake, now=0)
+        prices, failures = app.fetch_price_history(("A", "NEW"), START, download=fake, now=100)
+        self.assertEqual(failures, {})
+        self.assertEqual(list(prices.columns), ["A", "NEW"])
+        entries = app._price_cache()["entries"]
+        self.assertEqual(len(entries), app.PRICE_CACHE_MAX)
+        self.assertIn("A", entries)
+
+    def test_eviction_drops_expired_entries_first(self):
+        fake = FakeYahoo()
+        old = ("X0", "X1", "X2")
+        app.fetch_price_history(old, START, download=fake, now=0)                  # expire at TTL
+        live = tuple(f"L{i:03d}" for i in range(app.PRICE_CACHE_MAX - len(old)))
+        app.fetch_price_history(live, START, download=fake, now=app.PRICE_CACHE_TTL - 600)
+        app.fetch_price_history(("N1", "N2"), START, download=fake, now=app.PRICE_CACHE_TTL + 1)
+        entries = app._price_cache()["entries"]
+        self.assertEqual(len(entries), app.PRICE_CACHE_MAX)
+        self.assertTrue(all(tk in entries for tk in live + ("N1", "N2")))
+        self.assertEqual(sum(tk in entries for tk in old), 1)
+
+
+class _Resp:
+    def __init__(self, text="", content=b""):
+        self.text, self.content = text, content
+
+    def raise_for_status(self):
+        pass
+
+
+class CpiFetchTest(unittest.TestCase):
+    """FRED CPI for the inflation adjustment: pd.read_csv(url) had no timeout, so a
+    stalled response hung the run; the request now carries one."""
+    CSV = "observation_date,CPIAUCSL\n2020-01-01,258.7\n2021-01-01,262.2\n"
+
+    def setUp(self):
+        app.fetch_cpi_data.clear()
+
+    def tearDown(self):
+        app.fetch_cpi_data.clear()
+
+    def test_request_carries_a_timeout_and_parses_the_csv(self):
+        calls = []
+
+        def fake_get(url, **kw):
+            calls.append(kw)
+            return _Resp(text=self.CSV)
+        with patch.object(app.requests, "get", fake_get):
+            cpi = app.fetch_cpi_data()
+        self.assertEqual(list(cpi.columns), ["CPI"])
+        self.assertAlmostEqual(cpi.loc["2021-01-01", "CPI"], 262.2)
+        self.assertTrue(calls[0].get("timeout"))
+
+    def test_stalled_server_gives_up_and_is_not_cached(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)                                        # accepts, never answers
+        real_get = requests.get
+        stalled = lambda url, **kw: real_get(f"http://127.0.0.1:{srv.getsockname()[1]}/cpi.csv", **kw)
+        outcome = {}
+
+        def run():
+            try:
+                app.fetch_cpi_data()
+                outcome["r"] = "returned"
+            except requests.RequestException as e:
+                outcome["r"] = type(e).__name__
+        try:
+            with patch.object(app, "CPI_TIMEOUT", 0.5), patch.object(app.requests, "get", stalled):
+                t = threading.Thread(target=run, daemon=True)
+                t.start()
+                t.join(10)
+        finally:
+            srv.close()
+        self.assertEqual(outcome.get("r"), "ReadTimeout", "still blocked on a stalled FRED")
+        with patch.object(app.requests, "get", lambda url, **kw: _Resp(text=self.CSV)):
+            self.assertEqual(len(app.fetch_cpi_data()), 2)   # the failure was not cached for 24 h
+
+
+class CnNameLookupTest(unittest.TestCase):
+    """Tencent name lookup: the failure counter used to be a module-level dict,
+    re-created by every rerun (the breaker never tripped), and a failed lookup
+    was cached for a day."""
+
+    def setUp(self):
+        app._cn_name_breaker.clear()
+        app._tencent_names.clear()
+
+    def tearDown(self):
+        app._cn_name_breaker.clear()
+        app._tencent_names.clear()
+
+    def test_failures_are_retried_until_the_breaker_trips(self):
+        calls = []
+
+        def down(url, **kw):
+            calls.append(url)
+            raise requests.ConnectionError("unreachable")
+        with patch.object(app.requests, "get", down):
+            for _ in range(app.CN_NAME_MAX_FAILURES):
+                names = app.fetch_cn_names(("511010.SS",))
+                self.assertEqual(names["511010.SS"], app.CN_NAME_SEED["511010.SS"])   # seed fallback
+            self.assertEqual(len(calls), app.CN_NAME_MAX_FAILURES)                     # none cached
+            app.fetch_cn_names(("511010.SS",))
+            app.fetch_cn_names(("600519.SS",))
+        self.assertEqual(len(calls), app.CN_NAME_MAX_FAILURES)                         # tripped: no more tries
+
+    def test_answer_is_cached_and_resets_the_breaker(self):
+        calls = []
+
+        def ok(url, **kw):
+            calls.append(url)
+            return _Resp(content='v_sh600519="1~贵州茅台~600519~1700.00";'.encode("gbk"))
+        app._cn_name_breaker()["n"] = 1
+        with patch.object(app.requests, "get", ok):
+            self.assertEqual(app.fetch_cn_names(("600519.SS",))["600519.SS"], "贵州茅台")
+            self.assertEqual(app.fetch_cn_names(("600519.SS",))["600519.SS"], "贵州茅台")
+        self.assertEqual(len(calls), 1)                      # answered once, then served from the day cache
+        self.assertEqual(app._cn_name_breaker()["n"], 0)
+
 
 def _two_port_config():
     return [
@@ -314,6 +444,58 @@ class AppRegressionTest(unittest.TestCase):
         self.assertNotIn("No data after", errors)
         # Shown once; the next Analyze retries instead of every widget rerun.
         self.assertFalse(at.session_state["run_backtest"])
+
+
+def _tooltip_fields(spec):
+    """Every tooltip field of a Vega-Lite spec (any layer depth)."""
+    out = set()
+    if isinstance(spec, dict):
+        if isinstance(spec.get("tooltip"), list):
+            out |= {t.get("field") for t in spec["tooltip"] if isinstance(t, dict)}
+        for v in spec.values():
+            out |= _tooltip_fields(v)
+    elif isinstance(spec, list):
+        for v in spec:
+            out |= _tooltip_fields(v)
+    return out
+
+
+class OutsideTextTest(unittest.TestCase):
+    """Names and reasons are data, not markup: a dotted series name is escaped as a
+    Vega-Lite field (its tooltip row was blank), "$" in Yahoo's reasons is escaped
+    for markdown (a "$…$" pair was typeset as LaTeX)."""
+
+    def setUp(self):
+        st.cache_resource.clear()
+
+    def tearDown(self):
+        st.cache_resource.clear()
+
+    def _run(self, fake, bench):
+        at = AppTest.from_file(APP, default_timeout=120)
+        at.session_state["portfolios_list"] = _two_port_config()
+        at.session_state["bi"] = bench
+        at.session_state["run_backtest"] = True
+        with patch.object(yf, "download", fake):
+            at.run()
+        self.assertFalse(at.exception)
+        return at
+
+    def test_dotted_benchmark_tooltip_field_is_escaped(self):
+        at = self._run(FakeYahoo(), "BRK.B")
+        charts = at.get("arrow_vega_lite_chart")
+        self.assertEqual(len(charts), 2)                     # cumulative return + drawdown
+        for chart in charts:
+            fields = _tooltip_fields(json.loads(chart.proto.spec))
+            self.assertIn("Benchmark(BRK\\.B)", fields)
+            self.assertNotIn("Benchmark(BRK.B)", fields)
+
+    def test_dollar_in_yahoo_reasons_is_escaped(self):
+        reason = "YFTzMissingError('${}: possibly delisted; no timezone found')"
+        at = self._run(FakeYahoo(failing={tk: reason.format(tk) for tk in ("DBMF", "KMLM")}), "SPY")
+        warn = next(str(w.value) for w in at.warning if "Yahoo returned no prices" in str(w.value))
+        self.assertIn("\\$DBMF: possibly delisted", warn)
+        self.assertNotRegex(warn, r"(?<!\\)\$")              # every "$" escaped
 
 
 class StartDateNoticeTest(unittest.TestCase):

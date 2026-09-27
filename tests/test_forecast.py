@@ -120,6 +120,16 @@ class SnapshotAnchorTest(unittest.TestCase):
         v = fc.path_values("S1", [fc.month_to_ts(24)], [fc.PORT])[fc.PORT].iloc[0]
         self.assertTrue(np.isnan(v))
 
+    def test_hold_keeps_the_final_value_past_the_horizon(self):
+        off = {s: 1.5 for s in fc.ALL_SERIES}
+        for offsets, shift in ((None, 0.0), (off, 1.5)):
+            v = fc.path_values("S1", [fc.month_to_ts(24)], fc.ALL_SERIES, offsets, hold=True).iloc[0]
+            for s in fc.ALL_SERIES:
+                self.assertAlmostEqual(v[s], fc.SCENARIOS["S1"][-1][s] + shift, places=9, msg=s)
+        # before the war it is still undefined
+        self.assertTrue(np.isnan(fc.path_values("S1", [pd.Timestamp("2026-02-01")], [fc.PORT],
+                                                hold=True)[fc.PORT].iloc[0]))
+
 
 class CalibrationTest(unittest.TestCase):
     def setUp(self):
@@ -208,6 +218,31 @@ class SummaryTablesTest(unittest.TestCase):
         actual = _actual_from_path("S1").loc[:"2026-03-20"]
         self.assertIsNone(fc.scorecard(actual, {}))
         self.assertIsNone(fc.scorecard(None, {}))
+
+    def test_past_a_horizon_the_weighted_numbers_never_go_blank(self):
+        """S1/S2 end at 12 months (2027-02-28). From March 2027 their NaN blanked the weighted
+        prediction and the whole per-asset weighted table."""
+        days = pd.bdate_range("2026-03-02", "2027-06-30")
+        actual = fc.path_values("S3", days, fc.ALL_SERIES)
+        card = fc.scorecard(actual, None)
+        rows = {r["key"]: r for r in card["rows"]}
+        self.assertTrue(all(np.isfinite(r["pred"]) and np.isfinite(r["rmse"]) for r in card["rows"]))
+        self.assertAlmostEqual(rows["S1"]["pred"], fc.SCENARIOS["S1"][-1][fc.PORT], places=9)
+        weighted = sum(fc.SCENARIO_META[k]["prob"] * rows[k]["pred"] for k in fc.SCENARIO_META)
+        self.assertAlmostEqual(rows["W"]["pred"], weighted, places=9)
+        wf = fc.weighted_forecast(card["day"], fc.ALL_SERIES, None)
+        self.assertTrue(all(np.isfinite(v) for v in wf.values()), wf)
+
+    def test_tracking_errors_cover_the_same_days_for_every_scenario(self):
+        """Past its horizon S1 used to drop out of its own RMSE: reality leaving its final value
+        after 2027-02-28 never counted against it."""
+        days = pd.bdate_range("2026-03-02", "2027-06-30")
+        on_path = fc.path_values("S1", days, [fc.PORT], hold=True)[fc.PORT]
+        actual = pd.DataFrame({fc.PORT: on_path.where(days <= fc.month_to_ts(12), on_path + 5.0)}, index=days)
+        rows = {r["key"]: r for r in fc.scorecard(actual, None)["rows"]}
+        after = (days > fc.month_to_ts(12)).sum()
+        total = (days > fc.PREDICTION_BASELINE).sum()
+        self.assertAlmostEqual(rows["S1"]["rmse"], np.sqrt(25.0 * after / total), places=9)
 
 
 class ChartLabelTest(unittest.TestCase):
@@ -313,6 +348,26 @@ class LoadActualTest(unittest.TestCase):
         self.assertEqual(len(fake.calls), 1)
         self.assertEqual(failures, {})
 
+    def test_forced_refresh_has_a_process_wide_cooldown(self):
+        """Any visitor can press refresh; each press re-downloaded, and a Yahoo rate limit then
+        hits every visitor. At most one forced download per REFRESH_COOLDOWN."""
+        fake = FakeYahoo()
+        fc.load_actual(now=0, download=fake)
+        self.assertEqual(fc.refresh_wait(now=0), 0)            # a normal load does not start a cooldown
+        fc.load_actual(force=True, now=10, download=fake)
+        self.assertEqual(len(fake.calls), 2)
+        fc.load_actual(force=True, now=70, download=fake)      # pressed again a minute later
+        self.assertEqual(len(fake.calls), 2)
+        self.assertAlmostEqual(fc.refresh_wait(now=70), fc.REFRESH_COOLDOWN - 60)
+        fc.load_actual(force=True, now=10 + fc.REFRESH_COOLDOWN, download=fake)
+        self.assertEqual(len(fake.calls), 3)
+
+    def test_cooldown_never_blocks_an_expired_entry(self):
+        fake = FakeYahoo(failing={"BTC": RATE_LIMITED})
+        fc.load_actual(force=True, now=0, download=fake)       # incomplete: retried after ACTUAL_RETRY_TTL
+        fc.load_actual(force=True, now=fc.ACTUAL_RETRY_TTL + 1, download=fake)
+        self.assertEqual(len(fake.calls), 2)                   # inside the cooldown, but the entry expired
+
 
 class AppSmokeTest(unittest.TestCase):
     def run_app(self, fake):
@@ -349,6 +404,17 @@ class AppSmokeTest(unittest.TestCase):
         at = self.run_app(FakeYahoo(raise_exc=ConnectionError("offline")))
         self.assertFalse(at.exception, at.exception)
         self.assertIn("未能获取实际市场数据", " ".join(w.value for w in at.warning))
+
+    def test_refresh_button_is_disabled_during_the_cooldown(self):
+        fake = FakeYahoo()
+        at = self.run_app(fake)
+        refresh = lambda: next(b for b in at.button if "刷新数据" in str(b.label))
+        self.assertFalse(refresh().proto.disabled)
+        with patch.object(yf, "download", fake):
+            refresh().click().run()
+        self.assertFalse(at.exception, at.exception)
+        self.assertEqual(len(fake.calls), 2)                   # the forced download happened
+        self.assertTrue(refresh().proto.disabled)
 
 
 if __name__ == "__main__":
