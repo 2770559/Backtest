@@ -6,9 +6,14 @@ unit-tested and reused outside the app.
 import numpy as np
 import pandas as pd
 
-# Bumped with every change to the engine's results; backtest_app reloads a stale module whose stamp differs
-# (Streamlit Cloud can keep the old module across a push).
-CORE_VERSION = "2026-09-26b"
+# Bumped with every change to the engine's results or messages; backtest_app reloads a stale module whose stamp
+# differs (Streamlit Cloud can keep the old module across a push).
+CORE_VERSION = "2026-09-27a"
+
+# prepare_portfolio scales weights that do not add up to 100% (more than float noise off) to 100%; it says
+# so only from this distance on, the allocation matrix's own "✓ 100%" tolerance (0.01 percentage points):
+# a sum the matrix shows as 100% ✓ (e.g. 33.333333% x 3) is scaled silently.
+WEIGHT_SUM_NOTICE_TOL = 1e-4
 
 # Strategy name constants
 STRAT_BH       = "Buy & Hold"
@@ -218,7 +223,9 @@ def normalize_slot_bands(raw):
     Percent integers; None (or a missing key) means "inherit the portfolio
     band" for that side. Malformed entries degrade to inherit instead of
     raising, and entries with neither side set are dropped, so a hand-edited
-    or legacy config can never break loading.
+    or legacy config can never break loading. That includes ±Infinity (JSON
+    accepts it), which raised OverflowError; the app clamps it to its band
+    range before calling this.
     """
     out = {}
     if not isinstance(raw, dict):
@@ -231,7 +238,7 @@ def normalize_slot_bands(raw):
             v = band.get(side)
             try:
                 entry[side] = None if v is None or v == "" else int(round(float(v)))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 entry[side] = None
         if entry["down"] is None and entry["up"] is None:
             continue
@@ -424,7 +431,8 @@ def prepare_portfolio(p, p_tks, p_wts, p_comp, price_df):
         # Validation lets weights add up to 99-101%; a full rebalance to targets that do not add up to 100%
         # would create or destroy money every time. Exactly-100% inputs stay byte-identical (legacy engine).
         w_series = w_series / total_w
-        out["notices"].append(("info", f"**{p['name']}**: weights add up to {total_w:.2%} \u2014 scaled to 100%."))
+        if abs(total_w - 1.0) >= WEIGHT_SUM_NOTICE_TOL:
+            out["notices"].append(("info", f"**{p['name']}**: weights add up to {total_w:.2%} \u2014 scaled to 100%."))
     if dropped_elems:
         out["notices"].append(("warning",
             f"**{p['name']}**: no data for **{', '.join(dropped_elems)}** \u2014 "

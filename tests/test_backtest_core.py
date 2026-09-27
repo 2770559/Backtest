@@ -391,6 +391,23 @@ class AlignPrepareTest(unittest.TestCase):
         self.assertEqual(list(out["w_series"]), [0.4, 0.3, 0.3])        # exactly 100%: untouched (legacy engine)
         self.assertFalse(any("scaled to 100%" in m for _, m in out["notices"]))
 
+    def test_a_sum_the_matrix_shows_as_100_is_scaled_silently(self):
+        """The notice appears exactly when the allocation matrix does not show "✓ 100%" (0.01 pp tolerance):
+        33.333333% x 3 was scaled with "weights add up to 100.00% — scaled to 100%". Scaling itself is
+        unchanged: every sum more than float noise off 100% is scaled."""
+        price_df = align_price_data(_prices(), "SPY", "2020-01-01", ["A", "B", "C"])["price_df"]
+        for weights, shown in (("0.333333, 0.333333, 0.333333", None), ("0.33335, 0.33335, 0.33335", None),
+                               ("0.3332, 0.3332, 0.3332", "99.96%"), ("0.33337, 0.33337, 0.33337", "100.01%")):
+            p = {"name": "P", "tickers": "A, B, C", "weights": weights, "thr": 40}
+            tks, wts, errs, comp = parse_portfolio(p)
+            out = prepare_portfolio(p, tks, wts, comp, price_df)
+            self.assertAlmostEqual(out["w_series"].sum(), 1.0, places=12, msg=weights)
+            msgs = [m for _, m in out["notices"] if "scaled to 100%" in m]
+            matrix_ok = abs(sum(float(w) * 100 for w in weights.split(",")) - 100) < 0.01   # the matrix's ✓
+            self.assertEqual(bool(msgs), not matrix_ok, (weights, msgs))
+            if shown:
+                self.assertIn(f"weights add up to {shown}", msgs[0])
+
     def test_app_reloads_a_stale_engine(self):
         import backtest_core
         app = (Path(__file__).resolve().parent.parent / "backtest_app.py").read_text(encoding="utf-8")

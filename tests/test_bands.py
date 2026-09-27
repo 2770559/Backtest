@@ -72,6 +72,12 @@ class TestNormalizeSlotBands(unittest.TestCase):
         self.assertEqual(normalize_slot_bands(None), {})
         self.assertEqual(normalize_slot_bands([1, 2]), {})
 
+    def test_infinity_degrades_instead_of_raising(self):
+        # JSON accepts Infinity; int(round(inf)) raised OverflowError out of a function documented never to
+        # raise. It degrades to inherit like any unparseable value (the app clamps it to 200 / 1 beforehand).
+        raw = {"A": {"down": float("inf"), "up": 30}, "B": {"down": float("-inf")}, "C": {"up": float("nan")}}
+        self.assertEqual(normalize_slot_bands(raw), {"A": {"down": None, "up": 30}})
+
 
 class TestBuildBandThresholds(unittest.TestCase):
     L2I = {"QQQM": "QQQM", "ETH-USD+MSTR": "__slot2", "GLDM": "GLDM"}

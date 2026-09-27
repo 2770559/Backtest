@@ -6,6 +6,7 @@ import altair as alt
 import requests
 import html
 import io
+import math
 import os
 import re
 import threading
@@ -27,7 +28,7 @@ try:
 except ImportError:            # optional dependency: browser-persisted default disabled
     HAS_JS_EVAL = False
 
-EXPECTED_CORE = "2026-09-26b"         # = backtest_core.CORE_VERSION
+EXPECTED_CORE = "2026-09-27a"         # = backtest_core.CORE_VERSION
 
 
 def _fresh_core():
@@ -61,8 +62,8 @@ from backtest_core import (
 BAND_MODE_LABELS = {BAND_MODE_REL: "Δ vs target", BAND_MODE_RATIO: "Leg vs rest"}
 
 # --- Version ---
-APP_VERSION = "2.8.0"  # semver: major.minor.patch
-APP_BUILD_DATE = "2026-09-26"
+APP_VERSION = "2.8.1"  # semver: major.minor.patch
+APP_BUILD_DATE = "2026-09-27"
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Portfolio Backtest", layout="wide", page_icon="📊")
@@ -381,14 +382,17 @@ START_DATE_MIN = datetime(1970, 1, 1).date()
 MIN_FUNDS, MAX_FUNDS = 100, 10 ** 12
 
 def _norm_band_pct(v, fallback):
-    """Band in percent as an int inside the UI's 1..200 range; None / non-numeric -> fallback."""
+    """Band in percent as an int inside the UI's 1..200 range; None / non-numeric / NaN -> fallback;
+    ±Infinity (JSON accepts it) is clamped like any other out-of-range value (it raised OverflowError)."""
     if v is None:
         return fallback
     try:
-        iv = int(round(float(v)))
+        f = float(v)
     except (TypeError, ValueError):
         return fallback
-    return min(200, max(1, iv))
+    if math.isnan(f):
+        return fallback
+    return int(round(min(200.0, max(1.0, f))))
 
 
 def _norm_band_mode(v):
@@ -406,9 +410,10 @@ def _md_text(s):
 
 def _vl_field(name):
     """A column name as a Vega-Lite field reference: "." and "[ ]" mean nested access there, so the tooltip
-    row of "Benchmark(510300.SS)" resolved to nothing (and an unmatched "]" breaks the chart). Escaped with
-    "\\"; the tooltip title keeps the plain name."""
-    return re.sub(r"([\\.\[\]])", r"\\\1", str(name))
+    row of "Benchmark(510300.SS)" resolved to nothing (and an unmatched "]" breaks the chart), and a quote
+    opens a quoted path segment: "Dad's" failed with "Access path missing closing quote", taking down both
+    charts. Each of \\ . [ ] ' " is escaped with "\\"; the tooltip title keeps the plain name."""
+    return re.sub(r"""([\\.\[\]'"])""", r"\\\1", str(name))
 
 
 def _stated_but_changed(raw, kept):
@@ -431,6 +436,30 @@ def _negative_weights(weights_str):
         except ValueError:
             pass
     return neg
+
+
+def _clamp_infinite_slot_bands(raw, name, warns):
+    """±Infinity in a hand-edited per-slot band (JSON accepts it) -> the editor's 200 / 1, reported (appended to
+    `warns`); it has no percent integer, and normalize_slot_bands raised OverflowError on it. Other values pass
+    through untouched for normalize_slot_bands."""
+    if not isinstance(raw, dict):
+        return raw
+    out = {}
+    for label, band in raw.items():
+        if isinstance(band, dict):
+            band = dict(band)
+            for side in ("down", "up"):
+                v = band.get(side)
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if math.isinf(f):
+                    band[side] = 200 if f > 0 else 1
+                    warns.append(f"**{name}**: per-slot {side} band of **{_md_text(str(label).strip())}** "
+                                 f"{_md_text(repr(v))} set to {band[side]}% (bands run 1–200%, like the editor's).")
+        out[label] = band
+    return out
 
 
 def _parse_config(loaded_config):
@@ -463,7 +492,7 @@ def _parse_config(loaded_config):
             if _stated_but_changed(raw.get(key), p[key]):
                 warns.append(f"**{name}**: {side} band {_md_text(repr(raw.get(key)))} set to {p[key]}% "
                              "(bands run 1–200%).")
-        p['slot_bands'] = normalize_slot_bands(p.get('slot_bands'))
+        p['slot_bands'] = normalize_slot_bands(_clamp_infinite_slot_bands(p.get('slot_bands'), name, warns))
         for label, band in p['slot_bands'].items():
             for side in ("down", "up"):
                 v = band[side]
@@ -484,8 +513,9 @@ def _parse_config(loaded_config):
                 "ticker, or a composite's members joined with '+'). Blank them in "
                 "*Per-slot bands* to drop them.")
         strat = p.get('strat')
-        strat = STRAT_LEGACY_MAP.get(strat, strat) if isinstance(strat, str) else strat
-        if strat not in VALID_STRATS:
+        if isinstance(strat, str):
+            strat = STRAT_LEGACY_MAP.get(strat, strat)
+        if not isinstance(strat, str) or strat not in VALID_STRATS:    # a list / dict raised TypeError (unhashable)
             if strat is not None:
                 warns.append(f"**{name}**: unknown strategy {_md_text(repr(strat))} — {STRAT_ASYM} used.")
             strat = STRAT_ASYM
@@ -501,8 +531,11 @@ def _parse_config(loaded_config):
 
     raw_sd, today = loaded_config.get("start_date", "2020-01-01"), datetime.today().date()
     try:
-        sd = pd.Timestamp(str(raw_sd)).date()
-    except (TypeError, ValueError):
+        ts = pd.Timestamp(str(raw_sd))
+        if pd.isna(ts):     # "", "nan", "NaT" parse to NaT, whose range check below raised TypeError
+            raise ValueError(f"not a date: {raw_sd!r}")
+        sd = ts.date()
+    except (TypeError, ValueError, OverflowError):
         warns.append(f"Start date {_md_text(repr(raw_sd))} is not a date — 2020-01-01 used.")
         sd = datetime(2020, 1, 1).date()
     if not START_DATE_MIN <= sd <= today:
@@ -735,11 +768,14 @@ _RATE_LIMIT_MARKERS = ("rate limit", "too many requests")
 @st.cache_resource(show_spinner=False)
 def _price_cache():
     """Process-wide singleton (same object on every rerun, for every session):
-    {"lock": Lock, "entries": {ticker: {expires, start, series|None, reason}}}.
-    The lock also serializes yf.download calls, whose per-ticker results go
-    through yfinance's module-global state (yf.shared) and would otherwise be
-    corrupted by two sessions downloading at once."""
-    return {"lock": threading.Lock(), "entries": {}}
+    {"lock": Lock, "download_lock": Lock, "entries": {ticker: {expires, start,
+    series|None, reason}}}. "lock" guards `entries` and is only ever held for
+    dict reads/writes, so a session served from the cache never waits for a
+    download. "download_lock" serializes yf.download calls, whose per-ticker
+    results go through yfinance's module-global state (yf.shared) and would
+    otherwise be corrupted by two sessions downloading at once. Entry dicts are
+    replaced, never mutated, so a reference taken under "lock" stays valid."""
+    return {"lock": threading.Lock(), "download_lock": threading.Lock(), "entries": {}}
 
 
 def clear_price_cache():
@@ -816,50 +852,61 @@ def fetch_price_history(tickers, start, download=None, now=None):
     rate limited, that only extends the block -- then negatively cached for
     PRICE_CACHE_MISS_TTL so widget reruns don't re-hit Yahoo (Analyze clears
     it, see forget_failed_prices). Raises when the download itself fails, so
-    nothing is cached. `download`/`now` are injection points for tests."""
+    nothing is cached. `download`/`now` are injection points for tests.
+
+    Locking: the cache lock is held only to read or write entries; the download
+    runs under the separate download lock. Every widget rerun of a session with
+    results on screen calls this, and it used to wait for whatever another
+    visitor was downloading (up to MAX_TICKERS_PER_RUN tickers plus a retry)."""
     tickers = list(dict.fromkeys(tickers))
     download = download or yf.download
     now = time.time() if now is None else now
     start_ts = pd.Timestamp(start)
     cache = _price_cache()
+    entries = cache["entries"]
+
+    def live(tk):
+        e = entries.get(tk)
+        return e is not None and e["expires"] > now and e["start"] <= start_ts
+
     with cache["lock"]:
-        entries = cache["entries"]
-
-        def live(tk):
-            e = entries.get(tk)
-            return e is not None and e["expires"] > now and e["start"] <= start_ts
-
-        missing = [tk for tk in tickers if not live(tk)]
-        if missing:
-            good, bad = _batch_close(missing, start, download)
-            retry = [tk for tk, why in bad.items() if not _is_rate_limited(why)]
-            if retry:
-                time.sleep(PRICE_RETRY_PAUSE)
-                good2, bad2 = _batch_close(retry, start, download)
-                good.update(good2)
-                bad = {tk: why for tk, why in bad.items() if tk not in good2}
-                bad.update(bad2)
-            for tk, s in good.items():
-                entries[tk] = {"expires": now + PRICE_CACHE_TTL, "start": start_ts,
-                               "series": s, "reason": None}
-            for tk, why in bad.items():
-                entries[tk] = {"expires": now + PRICE_CACHE_MISS_TTL, "start": start_ts,
-                               "series": None, "reason": why}
-            if len(entries) > PRICE_CACHE_MAX:
-                # Earliest expiry first, so expired entries go before live ones; never a ticker of
-                # this request: its entry is read right below (evicting it raised KeyError once the
-                # process-wide cache was full).
-                wanted = set(tickers)
-                oldest = sorted((k for k in entries if k not in wanted), key=lambda k: entries[k]["expires"])
-                for tk in oldest[:len(entries) - PRICE_CACHE_MAX]:
-                    del entries[tk]
-        frames, failures = [], {}
-        for tk in tickers:
-            e = entries[tk]
-            if e["series"] is None:
-                failures[tk] = e["reason"]
-            else:
-                frames.append(e["series"])
+        held = {tk: entries[tk] for tk in tickers if live(tk)}
+    if len(held) < len(tickers):
+        with cache["download_lock"]:
+            # Another session may have fetched some of them while this one waited.
+            with cache["lock"]:
+                held.update({tk: entries[tk] for tk in tickers if tk not in held and live(tk)})
+            missing = [tk for tk in tickers if tk not in held]
+            if missing:
+                good, bad = _batch_close(missing, start, download)
+                retry = [tk for tk, why in bad.items() if not _is_rate_limited(why)]
+                if retry:
+                    time.sleep(PRICE_RETRY_PAUSE)
+                    good2, bad2 = _batch_close(retry, start, download)
+                    good.update(good2)
+                    bad = {tk: why for tk, why in bad.items() if tk not in good2}
+                    bad.update(bad2)
+                fresh = {tk: {"expires": now + PRICE_CACHE_TTL, "start": start_ts, "series": s, "reason": None}
+                         for tk, s in good.items()}
+                fresh.update({tk: {"expires": now + PRICE_CACHE_MISS_TTL, "start": start_ts, "series": None,
+                                   "reason": why} for tk, why in bad.items()})
+                held.update(fresh)
+                with cache["lock"]:
+                    entries.update(fresh)
+                    if len(entries) > PRICE_CACHE_MAX:
+                        # Earliest expiry first, so expired entries go before live ones; never a ticker
+                        # of this request, which the next rerun asks for again.
+                        wanted = set(tickers)
+                        oldest = sorted((k for k in entries if k not in wanted), key=lambda k: entries[k]["expires"])
+                        for tk in oldest[:len(entries) - PRICE_CACHE_MAX]:
+                            del entries[tk]
+    frames, failures = [], {}
+    for tk in tickers:
+        e = held[tk]
+        if e["series"] is None:
+            failures[tk] = e["reason"]
+        else:
+            frames.append(e["series"])
     prices = pd.concat(frames, axis=1, sort=True) if frames else pd.DataFrame()
     if len(prices):
         prices = prices[prices.index >= start_ts]
@@ -872,11 +919,14 @@ def fetch_price_history(tickers, start, download=None, now=None):
 # the allocation matrix's token column ("Asset").
 RESERVED_SERIES_NAMES = {"Date", "Return", "Drawdown", "Portfolio", "Asset"}
 # Distinct tickers (benchmark included) one Analyze may download: the public app's
-# downloads share one lock, so a huge request made every other visitor wait.
+# downloads run one at a time (yfinance's shared state), so a huge request made
+# every other visitor's download wait.
 MAX_TICKERS_PER_RUN = 60
 
 def validate_inputs(portfolios, benchmark):
-    """Validate benchmark + all portfolio configs. Returns list of error messages."""
+    """Validate benchmark + all portfolio configs. Returns list of error messages, markdown-ready: they are
+    shown with st.error / joined into one, and names and tickers are user text, so every "$" is escaped
+    (two of them in one message were typeset as LaTeX)."""
     errors = []
     if not str(benchmark).strip():
         errors.append("Benchmark ticker is empty")
@@ -902,7 +952,7 @@ def validate_inputs(portfolios, benchmark):
     if len(all_tks) > MAX_TICKERS_PER_RUN:
         errors.append(f"{len(all_tks)} distinct tickers (benchmark included) — one run downloads at most "
                       f"{MAX_TICKERS_PER_RUN}. Remove some assets, or compare them in separate runs.")
-    return errors
+    return [_md_text(e) for e in errors]
 
 # --- Allocation matrix (Portfolio-Visualizer style editor) ------------------
 # The matrix is a VIEW over the stored per-portfolio tickers/weights strings:
@@ -940,7 +990,12 @@ def build_alloc_df(ports):
 
 
 def sync_alloc(df, ports):
-    """Write the edited matrix back into each portfolio's tickers/weights strings."""
+    """Write the edited matrix back into each portfolio's tickers/weights strings.
+
+    Weights keep 10 significant digits: "%g" kept 6, so this sync (it runs on
+    every rerun) rewrote a loaded 0.3333333333 as 0.333333, and three 33.333333%
+    cells were stored as a 99.9999% portfolio. Float noise of the percent
+    round trip (0.58 * 100 = 57.99999999999999) still prints as "0.58"."""
     for p in ports:
         if p["name"] not in df.columns:
             continue
@@ -951,7 +1006,7 @@ def sync_alloc(df, ports):
             if not tok or pd.isna(w) or w == 0:
                 continue
             tks.append(tok)
-            wts.append(f"{w / 100:g}")
+            wts.append(f"{w / 100:.10g}")
         p["tickers"] = ", ".join(tks)
         p["weights"] = ", ".join(wts)
 
@@ -997,15 +1052,22 @@ def _cn_name_breaker():
 
 
 class CNNamesUnavailable(Exception):
-    """Tencent's endpoint gave no answer. Raised inside the cached lookup, so the
-    failure is not cached for a day (exceptions bypass st.cache_data)."""
+    """Tencent's endpoint gave no usable answer. Raised inside the cached lookup,
+    so the failure is not cached for a day (exceptions bypass st.cache_data)."""
+
+
+_TENCENT_ENTRY = re.compile(r'v_(s[hz]\d+)="([^"]*)"')
+_TENCENT_NO_MATCH = "v_pv_none_match"     # Tencent's whole answer when none of the requested codes exists
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _tencent_names(codes):
     """codes: ((tencent code, ticker), ...) -> {ticker: Chinese short name}. The
     HTTP call runs on a daemon thread with a hard 4s deadline so even a hung DNS
-    lookup can't block the script; no answer raises CNNamesUnavailable."""
+    lookup can't block the script. No answer, an HTTP error, or a body that is
+    not a quote answer (neither a v_sh…/v_sz…="…" entry nor Tencent's no-match
+    marker) raises CNNamesUnavailable and counts toward the breaker: a 403 / 429
+    / error page used to be cached for a day as "no names"."""
     code_map = dict(codes)
     breaker = _cn_name_breaker()
     box = {}
@@ -1014,6 +1076,7 @@ def _tencent_names(codes):
         try:
             r = requests.get("https://qt.gtimg.cn/q=" + ",".join(code_map),
                              headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+            r.raise_for_status()
             box["payload"] = r.content.decode("gbk", errors="replace")
         except Exception:
             pass
@@ -1022,12 +1085,12 @@ def _tencent_names(codes):
     t.start()
     t.join(4.0)
     payload = box.get("payload")
-    if payload is None:
+    if payload is None or not (_TENCENT_ENTRY.search(payload) or _TENCENT_NO_MATCH in payload):
         breaker["n"] += 1
-        raise CNNamesUnavailable("Tencent quote endpoint did not answer")
+        raise CNNamesUnavailable("Tencent quote endpoint gave no quote answer")
     breaker["n"] = 0
     names = {}
-    for m in re.finditer(r'v_(s[hz]\d+)="([^"]*)"', payload):
+    for m in _TENCENT_ENTRY.finditer(payload):
         parts = m.group(2).split("~")
         if len(parts) > 2 and parts[1] and m.group(1) in code_map:
             names[code_map[m.group(1)]] = parts[1]
@@ -1270,21 +1333,26 @@ def render_slot_band_editors(ports):
     st.session_state['_sb_base'] = bases
 
 
+class SymbolSearchUnavailable(Exception):
+    """Yahoo's search gave no usable answer. Raised inside the cached lookup, so
+    the failure is not cached (exceptions bypass st.cache_data)."""
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def yahoo_symbol_search(query):
-    """Ticker/fund-name typeahead via Yahoo's symbol-search endpoint.
-    Returns [(label, symbol), ...]; [] on any failure (search is best-effort)."""
-    q = str(query or "").strip()
-    if len(q) < 2:
-        return []
-    try:
-        r = requests.get(
-            "https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q": q, "quotesCount": 10, "newsCount": 0},
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        quotes = r.json().get("quotes", [])
-    except Exception:
-        return []
+def _yahoo_search(q):
+    """One symbol-search answer -> [(label, symbol), ...], cached for an hour.
+    Raises on any failure: a returned [] used to be cached too, so a Yahoo rate
+    limit or network blip blanked the typeahead for that query for an hour, for
+    every visitor."""
+    r = requests.get(
+        "https://query2.finance.yahoo.com/v1/finance/search",
+        params={"q": q, "quotesCount": 10, "newsCount": 0},
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+    r.raise_for_status()
+    payload = r.json()
+    quotes = payload.get("quotes") if isinstance(payload, dict) else None
+    if not isinstance(quotes, list):
+        raise SymbolSearchUnavailable("no quote list in the answer")
     out = []
     for it in quotes:
         sym = it.get("symbol")
@@ -1294,6 +1362,20 @@ def yahoo_symbol_search(query):
         tail = " · ".join(x for x in (it.get("quoteType"), it.get("exchange")) if x)
         out.append((f"{name} ({sym})" + (f" · {tail}" if tail else ""), sym))
     return out
+
+
+def yahoo_symbol_search(query):
+    """Ticker/fund-name typeahead via Yahoo's symbol-search endpoint (the
+    searchbox calls this on every debounced keystroke). Returns [(label,
+    symbol), ...]; [] on any failure (search is best-effort) — answers are
+    cached for an hour, failures are not."""
+    q = str(query or "").strip()
+    if len(q) < 2:
+        return []
+    try:
+        return _yahoo_search(q)
+    except Exception:
+        return []
 
 
 CPI_TIMEOUT = 10    # seconds per connect / read: pd.read_csv(url) had none, so a stalled FRED hung the run
@@ -1460,10 +1542,11 @@ def _confirm_save_default():
     """Confirmation gate for Save Default (accidental clicks would silently
     replace the persisted setup). Also hosts the reset-to-built-ins action."""
     ports = st.session_state.portfolios_list
+    # Names and the benchmark are user text: "$" escaped, or a name's "$" and the amount's pair up as LaTeX.
     st.markdown(
-        "New sessions will open with **" + ", ".join(p['name'] for p in ports) + "** · "
-        f"benchmark `{st.session_state['bi']}` · start {st.session_state['sd']} · "
-        f"${st.session_state['init_funds']:,}")
+        "New sessions will open with **" + _md_text(", ".join(str(p['name']) for p in ports)) + "** · "
+        f"benchmark **{_md_text(st.session_state['bi'])}** · start {st.session_state['sd']} · "
+        f"\\${st.session_state['init_funds']:,}")
     has_saved = (FILE_DEFAULT and DEFAULT_CONFIG_PATH.is_file()) or st.session_state.get('_ls_default_present')
     if has_saved:
         st.warning("A saved default already exists — Confirm will **replace** it.")
@@ -1662,9 +1745,9 @@ with st.container(border=True):
         if st.button(":material/bookmark_add: Save Default", width="stretch",
                      help="Save the current setup (portfolios, benchmark, start date, initial "
                           "funds) as the startup default — new sessions open with it. Stored "
-                          "in Backtest/_default.json AND this browser (the browser copy "
-                          "survives cloud redeploys). A confirmation dialog guards against "
-                          "accidental clicks and offers reset-to-built-ins."):
+                          "in this browser" + ("" if ON_SHARED_HOST else " and in Backtest/_default.json on "
+                          "this machine") + ". A confirmation dialog guards against accidental clicks and "
+                          "offers reset-to-built-ins."):
             flush_alloc_edits()  # save must include edits delivered in this same event
             flush_slot_band_edits()
             _errs = validate_inputs(st.session_state.portfolios_list, st.session_state['bi'])
@@ -1928,10 +2011,11 @@ if st.session_state.run_backtest:
             # bands: backtest_core.prepare_portfolio (v2.6.0), shared with the
             # live desk; messages unchanged.
             prep = prepare_portfolio(p, p_tks, p_wts, p_comp, price_df)
+            # The engine's messages carry the portfolio name (user text): "$" escaped.
             if prep["error"]:
-                st.error(prep["error"]); continue
+                st.error(_md_text(prep["error"])); continue
             for _lvl, _msg in prep["notices"]:
-                (st.warning if _lvl == "warning" else st.info)(_msg)
+                (st.warning if _lvl == "warning" else st.info)(_md_text(_msg))
             valid_p_tks, w_series, groups = prep["valid_tks"], prep["w_series"], prep["groups"]
             slots, slot_survivors = prep["slots"], prep["slot_survivors"]
             thr_dn, thr_up = prep["thr_dn"], prep["thr_up"]

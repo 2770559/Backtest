@@ -266,12 +266,94 @@ class FetchPriceHistoryTest(unittest.TestCase):
         self.assertEqual(sum(tk in entries for tk in old), 1)
 
 
+class PriceCacheLockTest(unittest.TestCase):
+    """The cache lock used to be held for the whole download, so every widget rerun of a session with
+    results on screen (a pure cache hit) waited for whatever another visitor was downloading. Downloads
+    still run one at a time (yfinance's shared state) and never fetch a ticker twice."""
+
+    def setUp(self):
+        app.clear_price_cache()
+        self._pause = app.PRICE_RETRY_PAUSE
+        app.PRICE_RETRY_PAUSE = 0
+
+    def tearDown(self):
+        app.PRICE_RETRY_PAUSE = self._pause
+        app.clear_price_cache()
+
+    @staticmethod
+    def _gated(fake):
+        """-> (download, entered, release): the download blocks inside until `release` is set."""
+        entered, release = threading.Event(), threading.Event()
+
+        def download(tickers, **kw):
+            entered.set()
+            release.wait(10)
+            return fake(tickers, **kw)
+        return download, entered, release
+
+    @staticmethod
+    def _call(out, key, *args, **kw):
+        t = threading.Thread(target=lambda: out.update({key: app.fetch_price_history(*args, **kw)}), daemon=True)
+        t.start()
+        return t
+
+    def test_a_cache_hit_does_not_wait_for_another_sessions_download(self):
+        fake = FakeYahoo()
+        app.fetch_price_history(("SPY", "TLT"), START, download=fake, now=0)
+        slow, entered, release = self._gated(fake)
+        out = {}
+        other = self._call(out, "other", ("NEW1", "NEW2"), START, download=slow, now=1)
+        try:
+            self.assertTrue(entered.wait(5))                  # the other session is inside its download
+            self._call(out, "hit", ("SPY", "TLT"), START, download=fake, now=2).join(5)
+            self.assertIn("hit", out, "a cache hit waited for another session's download")
+            prices, failures = out["hit"]
+            self.assertEqual((list(prices.columns), failures), (["SPY", "TLT"], {}))
+        finally:
+            release.set()
+            other.join(10)
+        self.assertEqual(sorted(map(sorted, fake.calls)), [["NEW1", "NEW2"], ["SPY", "TLT"]])
+
+    def test_a_ticker_being_downloaded_is_not_fetched_twice(self):
+        fake = FakeYahoo()
+        slow, entered, release = self._gated(fake)
+        out = {}
+        first = self._call(out, "a", ("X",), START, download=slow, now=0)
+        try:
+            self.assertTrue(entered.wait(5))
+            second = self._call(out, "b", ("X", "Y"), START, download=fake, now=1)
+            second.join(0.3)
+            self.assertTrue(second.is_alive())                # waits for the download in flight
+        finally:
+            release.set()
+            first.join(10)
+        second.join(10)
+        self.assertEqual(fake.calls, [["X"], ["Y"]])          # X once (first session), then only Y
+        pd.testing.assert_series_equal(out["a"][0]["X"], out["b"][0]["X"])
+
+
 class _Resp:
     def __init__(self, text="", content=b""):
         self.text, self.content = text, content
 
     def raise_for_status(self):
         pass
+
+
+class _HttpResp:
+    """requests.Response stand-in with a status code (raise_for_status) and an optional JSON payload."""
+
+    def __init__(self, status=200, content=b"", payload=None):
+        self.status_code, self.content, self._payload = status, content, payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Error")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not JSON")
+        return self._payload
 
 
 class CpiFetchTest(unittest.TestCase):
@@ -364,6 +446,74 @@ class CnNameLookupTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)                      # answered once, then served from the day cache
         self.assertEqual(app._cn_name_breaker()["n"], 0)
 
+    def test_http_error_or_non_quote_body_is_not_cached(self):
+        """Any HTTP answer used to count: a 403 / 429 / error page reset the breaker and was cached for a
+        day as "no names", so the labels stayed missing after Tencent recovered."""
+        good = _HttpResp(200, 'v_sh600519="1~贵州茅台~600519~1700.00";'.encode("gbk"))
+        for bad in (_HttpResp(403, b"<html>Forbidden</html>"), _HttpResp(429, b""),
+                    _HttpResp(200, b"<html>captive portal</html>"), _HttpResp(200, b"")):
+            app._cn_name_breaker.clear()
+            app._tencent_names.clear()
+            with patch.object(app.requests, "get", lambda url, **kw: bad):
+                self.assertNotIn("600519.SS", app.fetch_cn_names(("600519.SS",)), bad.content)
+            self.assertEqual(app._cn_name_breaker()["n"], 1, bad.content)      # counted as a failure
+            with patch.object(app.requests, "get", lambda url, **kw: good):
+                self.assertEqual(app.fetch_cn_names(("600519.SS",))["600519.SS"], "贵州茅台", bad.content)
+            self.assertEqual(app._cn_name_breaker()["n"], 0)
+
+    def test_no_such_code_is_an_answer_not_a_failure(self):
+        """Tencent's whole answer is v_pv_none_match when none of the codes exists: cached like any answer,
+        and it resets the breaker — a visitor's mistyped code must not trip it for every visitor."""
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            return _HttpResp(200, b'v_pv_none_match="1";\n')
+        app._cn_name_breaker()["n"] = 1
+        with patch.object(app.requests, "get", get):
+            for _ in range(3):
+                self.assertNotIn("999999.SS", app.fetch_cn_names(("999999.SS",)))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(app._cn_name_breaker()["n"], 0)
+
+
+class SymbolSearchTest(unittest.TestCase):
+    """The typeahead's answers are cached for an hour; its failures were cached too (as []), so a Yahoo rate
+    limit or network blip blanked the search for that query for an hour, for every visitor."""
+    ANSWER = {"quotes": [{"symbol": "QQQ", "shortname": "Invesco QQQ", "quoteType": "ETF", "exchange": "NMS"}]}
+    RESULT = [("Invesco QQQ (QQQ) · ETF · NMS", "QQQ")]
+
+    def setUp(self):
+        app._yahoo_search.clear()
+
+    def tearDown(self):
+        app._yahoo_search.clear()
+
+    def test_failures_are_not_cached(self):
+        for failure in (requests.ConnectionError("blip"), _HttpResp(429, b"Too Many Requests"),
+                        _HttpResp(200, b"<html>", payload=None), _HttpResp(200, b"{}", payload={"finance": {}})):
+            def get(url, **kw):
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            with patch.object(app.requests, "get", get):
+                self.assertEqual(app.yahoo_symbol_search("QQQ"), [], failure)
+            with patch.object(app.requests, "get", lambda url, **kw: _HttpResp(200, b"{}", payload=self.ANSWER)):
+                self.assertEqual(app.yahoo_symbol_search("QQQ"), self.RESULT, failure)
+            app._yahoo_search.clear()
+
+    def test_answers_are_cached(self):
+        calls = []
+
+        def get(url, **kw):
+            calls.append(kw["params"]["q"])
+            return _HttpResp(200, b"{}", payload=self.ANSWER)
+        with patch.object(app.requests, "get", get):
+            self.assertEqual(app.yahoo_symbol_search("QQQ"), self.RESULT)
+            self.assertEqual(app.yahoo_symbol_search(" QQQ "), self.RESULT)
+            self.assertEqual(app.yahoo_symbol_search("Q"), [])       # too short: never requested
+        self.assertEqual(calls, ["QQQ"])
+
 
 def _two_port_config():
     return [
@@ -446,6 +596,56 @@ class AppRegressionTest(unittest.TestCase):
         self.assertFalse(at.session_state["run_backtest"])
 
 
+def _vega_access_path(p):
+    """Python port of vega-util's splitAccessPath, the parser Vega-Lite runs on every field name (checked
+    against the copy bundled in Streamlit's frontend): "." and "[ ]" split the path, a quote at the start
+    of a segment opens a quoted segment, "\\" escapes the next character. Raises like the browser does."""
+    path, n = [], len(p)
+    q, b, s, i, j = None, 0, "", 0, 0
+
+    def push():
+        nonlocal s, i
+        path.append(s + p[i:j])
+        s, i = "", j + 1
+    while j < n:
+        c = p[j]
+        if c == "\\":
+            s += p[i:j]
+            j += 1
+            i = j
+        elif c == q:
+            push()
+            q, b = None, -1
+        elif q:
+            pass
+        elif i == b and c in "\"'":
+            i, q = j + 1, c
+        elif c == "." and not b:
+            if j > i:
+                push()
+            else:
+                i = j + 1
+        elif c == "[":
+            if j > i:
+                push()
+            b = i = j + 1
+        elif c == "]":
+            if not b:
+                raise ValueError("Access path missing open bracket: " + p)
+            if b > 0:
+                push()
+            b, i = 0, j + 1
+        j += 1
+    if b:
+        raise ValueError("Access path missing closing bracket: " + p)
+    if q:
+        raise ValueError("Access path missing closing quote: " + p)
+    if j > i:
+        j += 1
+        push()
+    return path
+
+
 def _tooltip_fields(spec):
     """Every tooltip field of a Vega-Lite spec (any layer depth)."""
     out = set()
@@ -471,15 +671,30 @@ class OutsideTextTest(unittest.TestCase):
     def tearDown(self):
         st.cache_resource.clear()
 
-    def _run(self, fake, bench):
+    def _run(self, fake, bench, ports=None):
         at = AppTest.from_file(APP, default_timeout=120)
-        at.session_state["portfolios_list"] = _two_port_config()
+        at.session_state["portfolios_list"] = ports or _two_port_config()
         at.session_state["bi"] = bench
         at.session_state["run_backtest"] = True
         with patch.object(yf, "download", fake):
             at.run()
         self.assertFalse(at.exception)
         return at
+
+    def test_quoted_names_keep_both_charts(self):
+        """A quote opens a quoted segment in a Vega field path: a portfolio named "Dad's" failed with
+        "Access path missing closing quote" and both charts were replaced by an error. Every tooltip field
+        must resolve, under Vega's own parsing rules, to exactly its series name."""
+        names = ["Dad's", "Mom's 60/40", '"Growth" mix']
+        base = _two_port_config()
+        ports = [dict(base[i % 2], id=f"q{i}", name=n) for i, n in enumerate(names)]
+        at = self._run(FakeYahoo(), "BRK.B", ports)
+        charts = at.get("arrow_vega_lite_chart")
+        self.assertEqual(len(charts), 2)                     # cumulative return + drawdown
+        for chart in charts:
+            paths = [_vega_access_path(f) for f in _tooltip_fields(json.loads(chart.proto.spec)) - {"Date"}]
+            self.assertTrue(all(len(p) == 1 for p in paths), paths)
+            self.assertEqual({p[0] for p in paths}, set(names) | {"Benchmark(BRK.B)"})
 
     def test_dotted_benchmark_tooltip_field_is_escaped(self):
         at = self._run(FakeYahoo(), "BRK.B")

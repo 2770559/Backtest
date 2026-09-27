@@ -65,6 +65,17 @@ class MergeEditorStateTest(unittest.TestCase):
         self.assertEqual(ports[0]["tickers"], "159941.SZ")
         self.assertEqual(ports[0]["weights"], "0.2")
 
+    def test_sync_keeps_ten_significant_digits(self):
+        """"%g" kept 6 digits, and this sync runs on every rerun: a loaded 0.3333333333 was rewritten as
+        0.333333, and three 33.333333% cells were stored as a 99.9999% portfolio."""
+        ports = [{"id": "p", "name": "P", "tickers": "A, B", "weights": "0.3333333333, 0.6666666667"}]
+        app.sync_alloc(app.build_alloc_df(ports), ports)
+        self.assertEqual(ports[0]["weights"], "0.3333333333, 0.6666666667")          # lossless round trip
+        app.sync_alloc(pd.DataFrame({"Asset": ["A", "B", "C"], "P": [33.333333, 33.333333, 33.333334]}), ports)
+        self.assertEqual(ports[0]["weights"], "0.33333333, 0.33333333, 0.33333334")
+        app.sync_alloc(pd.DataFrame({"Asset": ["A", "B"], "P": [0.58 * 100, 42.0]}), ports)   # 57.99999999999999
+        self.assertEqual(ports[0]["weights"], "0.58, 0.42")                               # no float noise
+
 
 class InFlightEditSurvivalTest(unittest.TestCase):
     """The reported bug: edits delivered in the same event as a
@@ -425,6 +436,37 @@ class ParseConfigTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 app._parse_config(bad)
 
+    def test_unparseable_start_dates_fall_back_instead_of_refusing_the_file(self):
+        # "", "nan", "NaT" parse to NaT, whose range check raised TypeError: the whole file was refused.
+        for raw in ("", "nan", "NaT", float("nan")):
+            cfg, warns = app._parse_config(_cfg(start_date=raw))
+            self.assertEqual(cfg["sd"], date(2020, 1, 1), raw)
+            self.assertTrue(any("Start date" in w and "not a date" in w for w in warns), (raw, warns))
+
+    def test_infinite_bands_are_clamped_not_refused(self):
+        # JSON accepts Infinity; int(round(inf)) raised OverflowError and the whole file was refused.
+        port = {"id": "a", "name": "P", "tickers": "SPY, TLT", "weights": "0.6, 0.4", "strat": "RelDiff Full",
+                "thr": float("inf"), "thr_up": float("-inf"),
+                "slot_bands": {"SPY": {"down": float("inf"), "up": "-Infinity"},
+                               "TLT": {"down": float("nan"), "up": 30}}}
+        cfg, warns = app._parse_config(_cfg(portfolios=[port]))
+        p = cfg["portfolios"][0]
+        self.assertEqual((p["thr"], p["thr_up"]), (200, 1))
+        self.assertEqual(p["slot_bands"], {"SPY": {"down": 200, "up": 1}, "TLT": {"down": None, "up": 30}})
+        self.assertEqual(len(warns), 4, warns)          # Down, Up, SPY down / up (NaN inherits, as "abc" does)
+        self.assertTrue(any("per-slot down band of **SPY** inf set to 200%" in w for w in warns), warns)
+        cfg, warns = app._parse_config(_cfg(portfolios=[dict(port, thr=float("nan"), thr_up=None, slot_bands={})]))
+        self.assertEqual((cfg["portfolios"][0]["thr"], cfg["portfolios"][0]["thr_up"]), (38, 38))
+        self.assertTrue(any("Down band nan set to 38%" in w for w in warns), warns)
+
+    def test_non_string_strategy_falls_back_with_a_warning(self):
+        # A list / dict raised TypeError (unhashable) in the strategy lookup: the whole file was refused.
+        for bad in (["RelDiff Full"], {"a": 1}, 3):
+            port = dict(_cfg()["portfolios"][0], strat=bad)
+            cfg, warns = app._parse_config(_cfg(portfolios=[port]))
+            self.assertEqual(cfg["portfolios"][0]["strat"], app.STRAT_ASYM, bad)
+            self.assertTrue(any("unknown strategy" in w for w in warns), (bad, warns))
+
     def test_input_is_not_mutated(self):
         raw = _cfg()
         snapshot = json.dumps(raw)
@@ -499,6 +541,24 @@ class ConfigLoadAppTest(unittest.TestCase):
             self.assertEqual(at.session_state["init_funds"], 10000)
             self.assertTrue(any("Initial investment" in str(w.value) for w in at.warning))
 
+    def test_malformed_values_load_with_warnings(self):
+        """A hand-edited file with an empty start date, Infinity bands and a list as strategy was refused as a
+        whole ("Load error: Cannot compare NaT…" / OverflowError / unhashable type). It now loads, corrected."""
+        port = dict(self.PORT_C, thr=float("inf"), strat=["RelDiff Mixed"],
+                    slot_bands={"159941.SZ": {"down": float("-inf")}})
+        with _SavedConfig(_cfg(start_date="", portfolios=[port]), "cfgload_malformed"):   # json writes Infinity
+            at = AppTest.from_file(APP, default_timeout=120).run()
+            _click_load(at)
+            self.assertFalse(at.exception)
+            self.assertEqual([e.value for e in at.error], [])
+            p = at.session_state["portfolios_list"][0]
+            self.assertEqual((p["name"], p["thr"], p["strat"], p["slot_bands"]),
+                             ("Port C", 200, app.STRAT_ASYM, {"159941.SZ": {"down": 1, "up": None}}))
+            self.assertEqual(at.session_state["sd"], date(2020, 1, 1))
+            warns = " ".join(str(w.value) for w in at.warning)
+            for part in ("Start date", "Down band inf", "per-slot down band", "unknown strategy"):
+                self.assertIn(part, warns)
+
     def test_copy_pasted_portfolio_ids_no_longer_crash(self):
         # Two portfolios with the same "id" collided as widget keys (StreamlitDuplicateElementKey).
         ports = [dict(self.PORT_C, id="same", name="A"), dict(self.PORT_C, id="same", name="B")]
@@ -547,6 +607,48 @@ class VegaFieldEscapeTest(unittest.TestCase):
         self.assertEqual(app._vl_field("Port [A]"), "Port \\[A\\]")
         self.assertEqual(app._vl_field("a\\b"), "a\\\\b")
         self.assertEqual(app._vl_field("AV-US 按腿80/125 · 加密60/90"), "AV-US 按腿80/125 · 加密60/90")
+
+    def test_quotes_are_escaped(self):
+        # A quote opens a quoted path segment in Vega: "Dad's" failed with "Access path missing closing quote".
+        # The chart-level check (both charts, parsed with Vega's rules) is in test_price_fetch.OutsideTextTest.
+        self.assertEqual(app._vl_field("Dad's"), "Dad\\'s")
+        self.assertEqual(app._vl_field('"Growth" mix'), '\\"Growth\\" mix')
+
+
+class MarkdownDollarTest(unittest.TestCase):
+    """User text reaches markdown with every "$" escaped: two of them in one element are typeset as LaTeX."""
+    UNESCAPED = r"(?<!\\)\$"
+
+    def setUp(self):
+        self.default_path = APP_DIR / "Backtest" / "_default.json"
+        self._had_default = self.default_path.exists()
+
+    def tearDown(self):
+        if not self._had_default:
+            self.default_path.unlink(missing_ok=True)
+
+    def test_validate_inputs_messages(self):
+        ports = [{"name": "$5k $10k", "tickers": "SPY", "weights": "1"},
+                 {"name": "$5k $10k", "tickers": "SPY", "weights": "1"},
+                 {"name": "Cash $A", "tickers": "$X, $Y", "weights": "0.5"}]
+        errs = app.validate_inputs(ports, "SPY")
+        self.assertTrue(any("Duplicate portfolio names: \\$5k \\$10k" in e for e in errs), errs)
+        self.assertTrue(any("**Cash \\$A**: 2 tickers vs 1 weights" in e for e in errs), errs)
+        for e in errs:
+            self.assertNotRegex(e, self.UNESCAPED)
+
+    def test_save_default_dialog(self):
+        at = AppTest.from_file(APP, default_timeout=120).run()
+        _name_input(at, "Port B").set_value("$5k $10k")
+        at.run()
+        [b for b in at.button if "Save Default" in str(b.label)][0].click()
+        at.run()
+        self.assertFalse(at.exception)
+        text = next(str(m.value) for m in at.markdown if "New sessions will open with" in str(m.value))
+        self.assertIn("\\$5k \\$10k", text)
+        self.assertIn("\\$10,000", text)                 # the dialog's own "$" before the amount
+        self.assertNotRegex(text, self.UNESCAPED)
+        self.assertEqual(self.default_path.exists(), self._had_default)    # nothing saved without Confirm
 
 
 if __name__ == "__main__":
